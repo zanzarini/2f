@@ -1097,7 +1097,7 @@ fn fetch(conn: &Connection, id: &str) -> Result<ChallengeRow> {
 
 fn entry_digest(hash: &str, sig: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"audit ");
+    hasher.update(b"audit\0");
     hasher.update(hash.as_bytes());
     hasher.update([0]);
     hasher.update(sig.as_bytes());

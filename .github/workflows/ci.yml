@@ -19,6 +19,12 @@ jobs:
       - run: cargo build --workspace --locked
       - name: End to end
         run: bash scripts/e2e.sh target/debug/twof
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pip install cryptography
+      - name: Rust, TypeScript and Python agree on random inputs
+        run: bash scripts/crosscheck.sh
 
   sdk-ts:
     runs-on: ubuntu-latest

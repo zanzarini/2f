@@ -75,6 +75,18 @@ fn build() -> Value {
         kid: server.kid(),
     };
 
+    let malformed = signed_but_malformed(&server, &payload);
+    // The Rust verifier refuses every one of them too.
+    for case in &malformed {
+        let lookup = |kid: &str| (kid == server.kid()).then(|| server.public());
+        let token = case["token"].as_str().unwrap();
+        assert!(
+            twof_core::receipt::verify(token, &lookup, &action, 2_000_000_100).is_err(),
+            "accepted a receipt where {}",
+            case["why"]
+        );
+    }
+
     json!({
         "canonical": canonical,
         "canonical_rejected": rejected,
@@ -90,8 +102,43 @@ fn build() -> Value {
             "approver_public_key": alice.public_hex(),
             "valid_at": 2_000_000_100u64,
             "expired_at": 2_000_000_301u64,
+            "malformed": malformed,
         },
     })
+}
+
+/// Receipts carrying a genuine signature of the server key over a payload of
+/// the wrong shape. Something that signs badly formed payloads should not
+/// exist, but a verifier must not depend on that.
+fn signed_but_malformed(server: &ServerKey, good: &ReceiptPayload) -> Vec<Value> {
+    let forge = |payload: &Value| {
+        let body = to_canonical(payload).unwrap();
+        let mut message = b"2F-RECEIPT-v1
+"
+        .to_vec();
+        message.extend_from_slice(body.as_bytes());
+        format!("{}.{}", b64(body.as_bytes()), b64(&server.sign(&message)))
+    };
+    let base = serde_json::to_value(good).unwrap();
+    let with = |field: &str, value: Value| {
+        let mut payload = base.clone();
+        payload[field] = value;
+        forge(&payload)
+    };
+    let without = |field: &str| {
+        let mut payload = base.clone();
+        payload.as_object_mut().unwrap().remove(field);
+        forge(&payload)
+    };
+    vec![
+        json!({ "why": "another version", "token": with("v", json!(2)) }),
+        json!({ "why": "expiry is text", "token": with("expires_at", json!("9999999999")) }),
+        json!({ "why": "expiry is missing", "token": without("expires_at") }),
+        json!({ "why": "issue time is text", "token": with("issued_at", json!("0")) }),
+        json!({ "why": "action hash is a number", "token": with("action_hash", json!(7)) }),
+        json!({ "why": "action hash is missing", "token": without("action_hash") }),
+        json!({ "why": "payload is a list", "token": forge(&json!([1, 2, 3])) }),
+    ]
 }
 
 #[test]

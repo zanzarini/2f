@@ -289,6 +289,12 @@ fn cosigner_refuses_forged_stale_or_inconsistent_webhooks() {
         w.vault.decide(&body, &sig, T0 + webhook::MAX_AGE + 1),
         Err(Error::Invalid(_))
     ));
+    // A clock far behind the server's is just as stale, even though the
+    // challenge itself has not expired from where the co-signer stands.
+    assert!(matches!(
+        w.vault.decide(&body, &sig, T0 - webhook::MAX_AGE - 1),
+        Err(Error::Invalid(_))
+    ));
 
     // A compromised server signs a webhook that shows a harmless action but
     // carries the binding of a dangerous one. The co-signer must not sign it.
@@ -455,4 +461,81 @@ fn a_machine_is_not_one_approver() {
         )
         .unwrap();
     assert_eq!(done.state, "approved");
+}
+
+#[test]
+fn the_delivery_loop_drops_what_the_server_did_not_queue() {
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!("twof-deliver-{}.db", std::process::id()));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", p.display()));
+        }
+        p
+    };
+    let svc = std::sync::Arc::new(
+        Service::open(&path, ServerKey::generate(), Config::default()).unwrap(),
+    );
+    let now = twof_server::http::now();
+    let project = svc.create_project("exchange", now).unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.busy_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    // Nothing listens there; a delivery attempt would fail and be retried.
+    raw.execute(
+        "INSERT INTO outbox (project, kind, target, body, seal, next_at) \
+         VALUES (?, 'webhook', 'http://127.0.0.1:9/hook', '{\"event\":\"challenge.approved\"}', 'AAAA', 0)",
+        [&project],
+    )
+    .unwrap();
+    assert_eq!(svc.outbox_due(now, 10).unwrap().len(), 1);
+    assert_eq!(twof_server::delivery::run_once(&svc, None), 0);
+    // Dropped for good: not waiting for a retry, now or later.
+    assert!(svc.outbox_due(now + 10_000_000, 10).unwrap().is_empty());
+    let (failed, attempts): (i64, i64) = raw
+        .query_row("SELECT failed, attempts FROM outbox", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        (failed, attempts),
+        (1, 0),
+        "discarded without a single attempt to send it"
+    );
+    drop(svc);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+fn cosigner_does_not_sign_a_request_whose_time_has_passed() {
+    let w = world();
+    let action = withdraw("100", "USDT", "0xaaa");
+    let hash = Action::from_value(action.clone())
+        .unwrap()
+        .hash_hex()
+        .unwrap();
+    // A fresh, genuinely signed notice about a request that expires in 5 seconds.
+    let binding = twof_core::Binding::new(
+        &w.project,
+        "ch_00000000000000000000000000000001",
+        &hash,
+        T0 + 5,
+    );
+    let body = twof_core::canonical::to_canonical(&json!({
+        "event": "challenge.pending", "ts": T0, "project": w.project,
+        "data": { "challenge": binding.challenge, "action": action, "binding": binding }
+    }))
+    .unwrap();
+    let sig = webhook::sign(w.svc.key(), body.as_bytes());
+    assert!(w.vault.decide(&body, &sig, T0 + 4).unwrap().is_some());
+    assert!(matches!(
+        w.vault.decide(&body, &sig, T0 + 5),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        w.vault.decide(&body, &sig, T0 + 60),
+        Err(Error::Invalid(_))
+    ));
 }

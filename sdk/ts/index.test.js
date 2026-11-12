@@ -55,6 +55,13 @@ test("expired, forged and malformed receipts are refused", () => {
   assert.throws(() => verifyReceipt(sneaky, keys, r.action, r.valid_at), code("unknown_key"));
 });
 
+test("a genuinely signed receipt of the wrong shape is refused", () => {
+  assert.ok(r.malformed.length >= 5);
+  for (const { why, token } of r.malformed) {
+    assert.throws(() => verifyReceipt(token, keys, r.action, r.valid_at), code("malformed"), why);
+  }
+});
+
 test("pinned approvers are verified without trusting the server", () => {
   const payload = verifyReceipt(r.token, keys, r.action, r.valid_at);
   assert.deepEqual(pinnedApprovers(payload, { [r.approver]: r.approver_public_key }), ["alice"]);

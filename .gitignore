@@ -7,3 +7,4 @@
 node_modules/
 __pycache__/
 dist/
+sdk/corpus.json

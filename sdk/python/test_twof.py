@@ -59,6 +59,12 @@ class Vectors(unittest.TestCase):
             with self.assertRaises(TwoFError):
                 verify_receipt(junk, KEYS, R["action"], R["valid_at"])
 
+    def test_genuinely_signed_receipt_of_the_wrong_shape_is_refused(self):
+        self.assertGreaterEqual(len(R["malformed"]), 5)
+        for case in R["malformed"]:
+            with self.subTest(case["why"]):
+                self.assert_code("malformed", verify_receipt, case["token"], KEYS, R["action"], R["valid_at"])
+
     def test_pinned_approvers(self):
         payload = verify_receipt(R["token"], KEYS, R["action"], R["valid_at"])
         self.assertEqual(pinned_approvers(payload, {R["approver"]: R["approver_public_key"]}), ["alice"])

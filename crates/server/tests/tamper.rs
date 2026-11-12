@@ -1050,3 +1050,186 @@ fn a_restarted_server_rebuilds_what_is_in_force_from_the_log() {
         Err(Error::Internal(_))
     ));
 }
+
+#[test]
+fn a_genuine_old_log_entry_replayed_at_the_end_grants_nothing() {
+    let w = world("replay-entry");
+    w.svc.revoke_credential(&w.project, &w.alice.1, T0).unwrap();
+    // The entry that once granted alice's credential carries a real signature.
+    // The attacker appends a copy of it after the revocation, and restores
+    // the table row, hoping the grant is read again.
+    let saved_seal = w.svc.audit_entries().unwrap().len(); // forces nothing; just reads
+    assert!(saved_seal > 0);
+    w.raw
+        .execute(
+            "INSERT INTO audit (seq, ts, kind, data, prev, hash, sig) \
+         SELECT (SELECT MAX(seq) FROM audit) + 1, ts, kind, data, prev, hash, sig FROM audit \
+         WHERE kind = 'credential.added' AND data LIKE ?",
+            [format!("%{}%", w.alice.1)],
+        )
+        .unwrap();
+    w.raw
+        .execute(
+            "UPDATE credentials SET revoked_at = NULL WHERE id = ?",
+            [&w.alice.1],
+        )
+        .unwrap();
+    // The server refuses to go on, rather than read a log that does not follow.
+    assert!(matches!(
+        w.svc.create_challenge(&w.project, big(), "k1", T0),
+        Err(Error::Internal(_))
+    ));
+    assert!(audit_broken(&w));
+
+    // The same at start-up: a fresh process on that file grants nothing.
+    let again = Service::open(
+        &w.path,
+        ServerKey::from_seed_hex(&w.svc.key().seed_hex()).unwrap(),
+        Config::default(),
+    )
+    .unwrap();
+    assert!(again.create_challenge(&w.project, big(), "k2", T0).is_err());
+}
+
+#[test]
+fn a_history_rewritten_under_a_checkpoint_is_refused_at_start() {
+    let w = world("rewrite");
+    w.svc
+        .create_challenge(
+            &w.project,
+            json!({ "type": "withdraw", "amount": "5", "asset": "USDT" }),
+            "k1",
+            T0,
+        )
+        .unwrap();
+    let checkpoint = w.svc.checkpoint(T0).unwrap().unwrap();
+    let seed = w.svc.key().seed_hex();
+    // Entries up to a checkpoint are vouched for by it and their signatures
+    // are not checked one by one at start. So the attacker rewrites that part
+    // of the history, with a chain that links perfectly, and keeps the
+    // genuine checkpoint row in place.
+    let entries = w.svc.audit_entries().unwrap();
+    let mut rewritten: Vec<twof_core::audit::Entry> = Vec::new();
+    for entry in entries.iter().filter(|e| e.seq <= checkpoint.seq) {
+        // The same history, except bob's revocation... never having been
+        // granted is replaced by a grant of the attacker's own key.
+        let data = if entry.kind == "credential.added" && entry.data["approver"] == "bob" {
+            let mut data = entry.data.clone();
+            data["public_key"] = json!(ServerKey::generate().public_hex());
+            data
+        } else {
+            entry.data.clone()
+        };
+        let previous = rewritten.last().map(|e| (e.seq, e.hash.clone()));
+        let next = twof_core::audit::next_entry(
+            previous.as_ref().map(|(s, h)| (*s, h.as_str())),
+            entry.ts,
+            &entry.kind,
+            data,
+        )
+        .unwrap();
+        rewritten.push(next);
+    }
+    assert!(
+        twof_core::audit::verify_chain(&rewritten).is_ok(),
+        "the forged chain links perfectly"
+    );
+    assert_ne!(rewritten.last().unwrap().hash, checkpoint.hash);
+    w.raw.execute("DELETE FROM audit", []).unwrap();
+    for entry in &rewritten {
+        w.raw.execute(
+            "INSERT INTO audit (seq, ts, kind, data, prev, hash, sig) VALUES (?, ?, ?, ?, ?, ?, 'AAAA')",
+            rusqlite::params![entry.seq as i64, entry.ts as i64, entry.kind, entry.data.to_string(), entry.prev, entry.hash],
+        ).unwrap();
+    }
+    let restarted = Service::open(
+        &w.path,
+        ServerKey::from_seed_hex(&seed).unwrap(),
+        Config::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        restarted.create_api_key(&w.project, "x", T0),
+        Err(Error::Internal(_))
+    ));
+    assert!(restarted
+        .create_challenge(&w.project, big(), "k9", T0)
+        .is_err());
+}
+
+#[test]
+fn an_unsigned_entry_that_changes_nothing_is_still_reported() {
+    let w = world("harmless-entry");
+    let (seq, hash): (i64, String) = w
+        .raw
+        .query_row(
+            "SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    // A note that grants nothing and matches no table, so only the missing
+    // signature gives it away.
+    let forged = twof_core::audit::next_entry(
+        Some((seq as u64, &hash)),
+        T0,
+        "note",
+        json!({ "text": "nothing to see" }),
+    )
+    .unwrap();
+    w.raw.execute(
+        "INSERT INTO audit (seq, ts, kind, data, prev, hash, sig) VALUES (?, ?, ?, ?, ?, ?, 'AAAA')",
+        rusqlite::params![forged.seq as i64, forged.ts as i64, forged.kind, forged.data.to_string(), forged.prev, forged.hash],
+    ).unwrap();
+    assert!(twof_core::audit::verify_chain(&w.svc.audit_entries().unwrap()).is_ok());
+    assert!(audit_broken(&w));
+}
+
+#[test]
+fn an_approval_given_before_a_revocation_does_not_come_back_with_the_row() {
+    let w = world("stale-approval");
+    let saved: Option<String> = w
+        .raw
+        .query_row(
+            "SELECT seal FROM credentials WHERE id = ?",
+            [&w.alice.1],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // Two people are needed. Alice approves, then her device is revoked.
+    let ch = w.svc.create_challenge(&w.project, big(), "k1", T0).unwrap();
+    w.svc
+        .submit_approval(&ch.id, &w.alice.1, &sign(&w, &w.alice.0, &ch.id), false, T0)
+        .unwrap();
+    w.svc.revoke_credential(&w.project, &w.alice.1, T0).unwrap();
+    assert!(w
+        .svc
+        .get_challenge(&w.project, &ch.id, T0)
+        .unwrap()
+        .approvals
+        .is_empty());
+
+    // Her row is put back with its genuine seal, so that her stored
+    // approval, a real signature, would count again next to bob's.
+    w.raw
+        .execute(
+            "UPDATE credentials SET revoked_at = NULL, seal = ? WHERE id = ?",
+            rusqlite::params![saved, w.alice.1],
+        )
+        .unwrap();
+    assert!(w
+        .svc
+        .get_challenge(&w.project, &ch.id, T0)
+        .unwrap()
+        .approvals
+        .is_empty());
+    let after_bob = w
+        .svc
+        .submit_approval(&ch.id, &w.bob.1, &sign(&w, &w.bob.0, &ch.id), false, T0)
+        .unwrap();
+    assert_eq!(
+        (after_bob.state.as_str(), after_bob.approvals.len()),
+        ("pending", 1)
+    );
+    assert!(after_bob.receipt.is_none());
+}
