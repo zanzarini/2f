@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "lists": {
+    "treasury": ["0x1111111111111111111111111111111111111111"]
+  },
+  "rules": [
+    {
+      "name": "small transfers to our own wallets pass alone",
+      "when": {
+        "type": ["withdraw"],
+        "asset": ["USDT"],
+        "amount_max": "500",
+        "destination_in": ["treasury"],
+        "velocity": { "window_secs": 86400, "max_total": "5000" }
+      },
+      "then": { "decision": "allow" }
+    },
+    {
+      "name": "large withdrawals need two people",
+      "when": { "type": ["withdraw"], "amount_min": "50000" },
+      "then": { "decision": "require", "requirements": [{ "count": 2 }] }
+    },
+    {
+      "name": "every other withdrawal needs one person",
+      "when": { "type": ["withdraw"] },
+      "then": { "decision": "require", "requirements": [{ "count": 1 }] }
+    }
+  ]
+}

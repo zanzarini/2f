@@ -1,0 +1,105 @@
+{
+  "actions": [
+    {
+      "action": {
+        "amount": "1500.25",
+        "asset": "USDT",
+        "destination": "0xAbC123",
+        "meta": {
+          "n": 3,
+          "order": "A-991"
+        },
+        "type": "withdraw"
+      },
+      "canonical": "{\"amount\":\"1500.25\",\"asset\":\"USDT\",\"destination\":\"0xAbC123\",\"meta\":{\"n\":3,\"order\":\"A-991\"},\"type\":\"withdraw\"}",
+      "hash": "8b9abaa3f4a84c72f005929085c1aeb010faf076966a36906bcd07ebe69cb50c"
+    },
+    {
+      "action": {
+        "type": "trade"
+      },
+      "canonical": "{\"type\":\"trade\"}",
+      "hash": "c1ad417307849aef2b197e6ea9165a8cdf199a08a194ec9d8ae95a91b5c75693"
+    },
+    {
+      "action": {
+        "amount": "0.01",
+        "asset": "BRL",
+        "destination": "chave@exemplo.com.br",
+        "meta": {
+          "nome": "João Ação"
+        },
+        "type": "pix"
+      },
+      "canonical": "{\"amount\":\"0.01\",\"asset\":\"BRL\",\"destination\":\"chave@exemplo.com.br\",\"meta\":{\"nome\":\"João Ação\"},\"type\":\"pix\"}",
+      "hash": "0fa5e8fa513b282c58b63dd97fafead85ed538f3779ca4eb1a4dc8a223b4276c"
+    }
+  ],
+  "binding": {
+    "binding": {
+      "action_hash": "8b9abaa3f4a84c72f005929085c1aeb010faf076966a36906bcd07ebe69cb50c",
+      "challenge": "ch_test",
+      "expires_at": 2000000600,
+      "project": "pj_test",
+      "v": 1
+    },
+    "hash": "YSoXkZvqs32TGZSO2ni21jPSctp6Ik2FCNZRxTt7BiA",
+    "reject_hash": "grk1gBaoUzELm7ZE-DB9TWMzyiZbZqUGkygTOxH3NSI"
+  },
+  "canonical": [
+    {
+      "input": "{\"b\":2,\"a\":1}",
+      "output": "{\"a\":1,\"b\":2}"
+    },
+    {
+      "input": "{ \"z\": [true, false, null, -7, 9007199254740991], \"a\": { \"y\": \"\", \"x\": [] } }",
+      "output": "{\"a\":{\"x\":[],\"y\":\"\"},\"z\":[true,false,null,-7,9007199254740991]}"
+    },
+    {
+      "input": "{\"\\u20ac\":\"Euro\",\"\\r\":\"CR\",\"\\ufb33\":\"Dalet\",\"1\":\"One\",\"\\ud83d\\ude00\":\"Emoji\",\"\\u0080\":\"Control\",\"\\u00f6\":\"o\"}",
+      "output": "{\"\\r\":\"CR\",\"1\":\"One\",\"\":\"Control\",\"ö\":\"o\",\"€\":\"Euro\",\"😀\":\"Emoji\",\"דּ\":\"Dalet\"}"
+    },
+    {
+      "input": "\"\\u20ac$\\u000F\\u000aA'\\u0042\\u0022\\u005c\\\\\\\"\\/\"",
+      "output": "\"€$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\""
+    },
+    {
+      "input": "{\"text\":\"tab\\there \\\"quoted\\\" \\\\ back \\u0001 \\u007f é 日本\"}",
+      "output": "{\"text\":\"tab\\there \\\"quoted\\\" \\\\ back \\u0001  é 日本\"}"
+    }
+  ],
+  "canonical_rejected": [
+    "{\"a\":1.5}",
+    "{\"a\":1e3}",
+    "{\"a\":9007199254740992}",
+    "{\"a\":1,\"a\":2}"
+  ],
+  "receipt": {
+    "action": {
+      "amount": "1500.25",
+      "asset": "USDT",
+      "destination": "0xAbC123",
+      "meta": {
+        "n": 3,
+        "order": "A-991"
+      },
+      "type": "withdraw"
+    },
+    "approver": "alice",
+    "approver_public_key": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+    "expired_at": 2000000301,
+    "other_action": {
+      "amount": "0.01",
+      "asset": "BRL",
+      "destination": "chave@exemplo.com.br",
+      "meta": {
+        "nome": "João Ação"
+      },
+      "type": "pix"
+    },
+    "server_kid": "10ba682c8ad13513",
+    "server_public_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "token": "eyJhY3Rpb25faGFzaCI6IjhiOWFiYWEzZjRhODRjNzJmMDA1OTI5MDg1YzFhZWIwMTBmYWYwNzY5NjZhMzY5MDZiY2QwN2ViZTY5Y2I1MGMiLCJhcHByb3ZhbHMiOlt7ImFwcHJvdmVyIjoiYWxpY2UiLCJraW5kIjoiZWQyNTUxOSIsInNpZyI6InVNRGVWdEVpdU5GR0cycVd5OFVLM09RTzlYcDNyTi1DN2sxWS1XMXc0UGZkVW03U0JHNW1TZU9oQ0hjUWpCWjhzOGE2QkxvaTZQTnpfY2l1dnNqWUFRIiwic3RyZW5ndGgiOiJzdHJvbmcifV0sImJpbmRpbmdfZXhwaXJlc19hdCI6MjAwMDAwMDYwMCwiY2hhbGxlbmdlIjoiY2hfdGVzdCIsImRlY2lzaW9uIjoiYXBwcm92ZWQiLCJleHBpcmVzX2F0IjoyMDAwMDAwMzAwLCJpZCI6InJjX3Rlc3QiLCJpc3N1ZWRfYXQiOjIwMDAwMDAwMDAsImtpZCI6IjEwYmE2ODJjOGFkMTM1MTMiLCJwcm9qZWN0IjoicGpfdGVzdCIsInJ1bGUiOiJuZWVkcyBhIHBlcnNvbiIsInYiOjF9.JrWBw2DnBPq7yAQAIJ6Ai_B6FahFCAEzSnTV19_Rorz-P1yqaepF3AxPzbuXqVyTFK8QG54iksPT5ZzfymLCDg",
+    "valid_at": 2000000100
+  }
+}

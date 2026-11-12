@@ -1,0 +1,9 @@
+target
+.git
+.github
+*.db
+*.db-wal
+*.db-shm
+*.key
+.env
+node_modules

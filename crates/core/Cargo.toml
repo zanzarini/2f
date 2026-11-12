@@ -1,0 +1,23 @@
+[package]
+name = "twof-core"
+description = "2F core: canonical encoding, policy engine, receipts and audit chain. No IO."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+base64.workspace = true
+hex.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+rust_decimal.workspace = true
+p256.workspace = true
+
+[dev-dependencies]
+proptest = "1"

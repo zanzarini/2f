@@ -1,0 +1,12 @@
+{
+  "name": "twof-client",
+  "version": "0.1.0",
+  "description": "Client for 2F: second factor for API transactions",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts"],
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test" }
+}
