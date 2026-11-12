@@ -180,7 +180,7 @@ A complete example is in [examples/policy.json](examples/policy.json).
 | **Bound to the action** | Receipts and approvals cover the SHA-256 of a canonical form. Change one digit of the amount and nothing verifies. |
 | **Nothing to steal in the database** | Public keys and hashes only. The signing key lives outside it. |
 | **Nothing to plant in the database** | Credentials, API keys, policies, enrollment links and every challenge are sealed with the server key. A row written by someone else is ignored; an edited policy denies everything; a planted approval does not count. |
-| **Signed audit log** | Hash chained and signed entry by entry. `twof audit verify` reports edits, deletions and grants that the log does not explain. |
+| **The log decides** | Hash chained and signed entry by entry. The server takes what is in force from it, so a revoked credential or a replaced policy cannot be put back in the tables, and it stops if the log is cut or altered. `twof audit verify` reports anything the log does not explain. |
 | **Does not trust itself** | Clients can pin device and co-signer keys and check their signatures inside the receipt, and the approval page and terminal approver recompute what they sign, so even a compromised 2F server cannot invent one of those approvals. |
 | **Fast** | Group commit and a read pool: about 3,000 durable authorizations per second and 450,000 reads per second in the [benchmark](docs/ARCHITECTURE.md#7-why-it-is-fast), on a laptop. |
 
@@ -214,7 +214,7 @@ schedule, storing its output somewhere the server cannot write.
 ## Development
 
 ```bash
-cargo test --workspace        # unit, attack, tamper and concurrency tests
+cargo test --workspace        # unit, attack, tamper, concurrency and random model tests
 bash scripts/e2e.sh           # real server, real HTTP, co-signer included
 (cd sdk/ts && node --test)
 (cd sdk/python && python -m unittest)

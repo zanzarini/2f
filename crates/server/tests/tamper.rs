@@ -715,6 +715,17 @@ fn the_audit_check_notices_an_old_policy_being_restored() {
         audit_broken(&w),
         "restoring a superseded policy is reported"
     );
+    // And the server does not act on it: the log says everything is refused.
+    let ch = w
+        .svc
+        .create_challenge(
+            &w.project,
+            json!({ "type": "withdraw", "amount": "5", "asset": "USDT" }),
+            "k1",
+            T0,
+        )
+        .unwrap();
+    assert_eq!(ch.state, "denied");
 }
 
 #[test]
@@ -797,4 +808,245 @@ fn the_same_passkey_id_in_another_project_changes_nothing() {
             .state,
         "approved"
     );
+}
+
+#[test]
+fn a_junk_row_planted_first_does_not_block_the_real_approval() {
+    let w = world("squat");
+    let ch = w.svc.create_challenge(&w.project, big(), "k1", T0).unwrap();
+    // Before alice approves, someone plants garbage under her credential.
+    w.raw
+        .execute(
+            "INSERT INTO approvals (challenge, approver, credential, kind, sig, created_at) \
+         VALUES (?, 'alice', ?, 'ed25519', 'AAAA', 0)",
+            rusqlite::params![ch.id, w.alice.1],
+        )
+        .unwrap();
+    let after_alice = w
+        .svc
+        .submit_approval(&ch.id, &w.alice.1, &sign(&w, &w.alice.0, &ch.id), false, T0)
+        .unwrap();
+    assert_eq!(
+        after_alice.approvals.len(),
+        1,
+        "her real signature replaced the garbage"
+    );
+    let done = w
+        .svc
+        .submit_approval(&ch.id, &w.bob.1, &sign(&w, &w.bob.0, &ch.id), false, T0)
+        .unwrap();
+    assert_eq!(done.state, "approved");
+}
+
+#[test]
+fn the_audit_check_notices_amounts_being_lowered_to_win_back_allowance() {
+    let w = world("amounts");
+    w.svc
+        .create_challenge(
+            &w.project,
+            json!({ "type": "withdraw", "amount": "9", "asset": "USDT" }),
+            "k1",
+            T0,
+        )
+        .unwrap();
+    assert!(w.svc.audit_verify().is_ok());
+    // The velocity limits read this column.
+    w.raw
+        .execute("UPDATE challenges SET amount = '0'", [])
+        .unwrap();
+    assert!(audit_broken(&w));
+    w.raw
+        .execute("UPDATE challenges SET amount = '9', asset = 'OTHER'", [])
+        .unwrap();
+    assert!(audit_broken(&w));
+    w.raw
+        .execute("UPDATE challenges SET asset = 'USDT'", [])
+        .unwrap();
+    assert!(w.svc.audit_verify().is_ok());
+}
+
+#[test]
+fn a_revoked_credential_put_back_with_its_real_seal_stays_revoked() {
+    let w = world("true-rollback");
+    // The attacker copies alice's row while it is valid, seal and all.
+    let saved: Option<String> = w
+        .raw
+        .query_row(
+            "SELECT seal FROM credentials WHERE id = ?",
+            [&w.alice.1],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let key_row: (String, Option<String>) = {
+        w.svc.create_api_key(&w.project, "bot", T0).unwrap();
+        w.raw
+            .query_row("SELECT id, seal FROM api_keys", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+    };
+    let api_key = w.svc.create_api_key(&w.project, "second", T0).unwrap();
+    // Alice's device is reported stolen and every API key is revoked.
+    w.svc.revoke_credential(&w.project, &w.alice.1, T0).unwrap();
+    w.svc.revoke_api_keys(&w.project, T0).unwrap();
+
+    // Everything is put back exactly as it was, with the genuine seals.
+    w.raw
+        .execute(
+            "UPDATE credentials SET revoked_at = NULL, seal = ? WHERE id = ?",
+            rusqlite::params![saved, w.alice.1],
+        )
+        .unwrap();
+    w.raw
+        .execute(
+            "UPDATE api_keys SET revoked_at = NULL, seal = ? WHERE id = ?",
+            rusqlite::params![key_row.1, key_row.0],
+        )
+        .unwrap();
+    w.raw
+        .execute(
+            "UPDATE api_keys SET revoked_at = NULL WHERE seal IS NULL",
+            [],
+        )
+        .unwrap();
+
+    let ch = w.svc.create_challenge(&w.project, big(), "k1", T0).unwrap();
+    let sig = sign(&w, &w.alice.0, &ch.id);
+    assert!(matches!(
+        w.svc.submit_approval(&ch.id, &w.alice.1, &sig, false, T0),
+        Err(Error::Forbidden(_))
+    ));
+    assert!(matches!(
+        w.svc.authenticate(&api_key),
+        Err(Error::Unauthorized)
+    ));
+    // Bob, who was never revoked, still works.
+    assert!(w
+        .svc
+        .submit_approval(&ch.id, &w.bob.1, &sign(&w, &w.bob.0, &ch.id), false, T0)
+        .is_ok());
+}
+
+#[test]
+fn a_log_that_was_cut_or_extended_by_someone_else_stops_the_server() {
+    // Cut: the newest entries are removed to hide a revocation.
+    let w = world("cut");
+    w.svc.revoke_credential(&w.project, &w.alice.1, T0).unwrap();
+    let head: i64 = w
+        .raw
+        .query_row("SELECT MAX(seq) FROM audit", [], |r| r.get(0))
+        .unwrap();
+    w.raw
+        .execute("DELETE FROM audit WHERE seq = ?", [head])
+        .unwrap();
+    assert!(matches!(
+        w.svc.create_challenge(&w.project, big(), "k1", T0),
+        Err(Error::Internal(_))
+    ));
+    assert!(matches!(
+        w.svc.create_api_key(&w.project, "x", T0),
+        Err(Error::Internal(_))
+    ));
+
+    // Extended: an entry nobody signed is appended.
+    let w = world("extend");
+    let (seq, hash, sig): (i64, String, String) = w
+        .raw
+        .query_row(
+            "SELECT seq, hash, sig FROM audit ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    let forged = twof_core::audit::next_entry(Some((seq as u64, &hash)), T0, "credential.added",
+        json!({ "credential": "cr_evil", "project": w.project, "approver": "alice", "kind": "ed25519", "public_key": "00" })).unwrap();
+    w.raw
+        .execute(
+            "INSERT INTO audit (seq, ts, kind, data, prev, hash, sig) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                forged.seq as i64,
+                forged.ts as i64,
+                forged.kind,
+                forged.data.to_string(),
+                forged.prev,
+                forged.hash,
+                sig
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        w.svc.create_challenge(&w.project, big(), "k1", T0),
+        Err(Error::Internal(_))
+    ));
+    assert!(audit_broken(&w));
+}
+
+#[test]
+fn a_restarted_server_rebuilds_what_is_in_force_from_the_log() {
+    let w = world("restart");
+    let api_key = w.svc.create_api_key(&w.project, "bot", T0).unwrap();
+    w.svc.revoke_credential(&w.project, &w.bob.1, T0).unwrap();
+    let ch = w.svc.create_challenge(&w.project, big(), "k1", T0).unwrap();
+    let sig_alice = sign(&w, &w.alice.0, &ch.id);
+    let sig_bob = sign(&w, &w.bob.0, &ch.id);
+    w.svc.checkpoint(T0).unwrap();
+    w.svc
+        .create_challenge(
+            &w.project,
+            json!({ "type": "withdraw", "amount": "5", "asset": "USDT" }),
+            "k2",
+            T0,
+        )
+        .unwrap();
+
+    // A second process on the same file, with the same key: a restart.
+    let again = Service::open(
+        &w.path,
+        ServerKey::from_seed_hex(&w.svc.key().seed_hex()).unwrap(),
+        Config::default(),
+    )
+    .unwrap();
+    assert_eq!(again.authenticate(&api_key).unwrap(), w.project);
+    assert!(matches!(
+        again.submit_approval(&ch.id, &w.bob.1, &sig_bob, false, T0),
+        Err(Error::Forbidden(_))
+    ));
+    assert_eq!(
+        again
+            .submit_approval(&ch.id, &w.alice.1, &sig_alice, false, T0)
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
+    assert!(again.audit_verify().is_ok());
+    // The first process picks up what the second one wrote.
+    assert_eq!(
+        w.svc
+            .get_challenge(&w.project, &ch.id, T0)
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
+    assert_eq!(w.svc.authenticate(&api_key).unwrap(), w.project);
+
+    // A log shorter than a checkpoint it holds is refused at start.
+    let cut: i64 = w
+        .raw
+        .query_row("SELECT seq FROM checkpoints", [], |r| r.get(0))
+        .unwrap();
+    w.raw
+        .execute("DELETE FROM audit WHERE seq >= ?", [cut])
+        .unwrap();
+    let third = Service::open(
+        &w.path,
+        ServerKey::from_seed_hex(&w.svc.key().seed_hex()).unwrap(),
+        Config::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        third.authenticate(&api_key),
+        Err(Error::Internal(_))
+    ));
 }

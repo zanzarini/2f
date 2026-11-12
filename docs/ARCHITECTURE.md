@@ -220,10 +220,10 @@ Measured with `cargo test --release -p twof-server --test bench -- --ignored
 
 | Operation | Throughput |
 |---|---|
-| Authenticate an API key | about 750,000 per second |
+| Authenticate an API key | about 240,000 per second |
 | Read a pending challenge | about 450,000 per second |
-| Create, allow by rule and issue a receipt (durable) | about 3,000 per second |
-| Create, approve with a signature and issue a receipt (durable) | about 1,700 per second |
+| Create, allow by rule and issue a receipt (durable) | about 3,900 per second |
+| Create, approve with a signature and issue a receipt (durable) | about 1,500 per second |
 
 These are in-process numbers for the service layer; HTTP adds its own cost,
 and your disk decides the write figures.
@@ -253,3 +253,20 @@ can use to grant themselves power: credentials, API keys, policies, enrollment
 links, notification settings and every challenge are sealed with the server
 key and refused when the seal does not verify. Stored approvals are verified
 again, signature by signature, whenever a quorum is counted.
+
+The tables are where grants are looked up, but the signed log is what decides
+them. The server follows the log entry by entry, checking that each one
+continues the last and carries its signature, and keeps in memory what the log
+says is in force. A row that the log does not support is ignored, however
+genuine its seal; a log that is cut, altered or extended by someone else stops
+the server.
+
+```mermaid
+flowchart LR
+    cli["CLI: grant, revoke,<br/>set policy"] -- "signed entry" --> log[("Audit log")]
+    log -- "followed entry by entry,<br/>each one verified" --> ledger["In memory:<br/>what is in force"]
+    table[("Tables")] -- "row found" --> check{"Sealed, and<br/>in force per the log?"}
+    ledger --> check
+    check -- "yes" --> use(["Used"])
+    check -- "no" --> ignore(["Ignored"])
+```

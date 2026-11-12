@@ -267,3 +267,95 @@ async fn nothing_about_the_request_is_examined_before_the_api_key() {
         (StatusCode::OK, Some("pending"))
     );
 }
+
+#[tokio::test]
+async fn random_garbage_never_breaks_the_server() {
+    let app = app(Config {
+        rate_per_minute: 0,
+        ..Config::default()
+    });
+    let (_, _, created) = send(&app, post("/v1/challenges", Some(&app.key), CREATE)).await;
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let pieces = [
+        "{",
+        "}",
+        "[",
+        "]",
+        ":",
+        ",",
+        "\"",
+        "\\",
+        "null",
+        "true",
+        "1",
+        "-1",
+        "1.5",
+        "1e999",
+        "\u{202e}",
+        "\"action\"",
+        "\"type\"",
+        "\"amount\"",
+        "\"idempotency_key\"",
+        "\"credential\"",
+        "\"signature\"",
+        "\"passkey\"",
+        "\"decision\"",
+        "\"receipt\"",
+        "\"id\"",
+        "\"approve\"",
+        "\"reject\"",
+        "\"x\"",
+        "\"authenticator_data\"",
+        "\"client_data_json\"",
+        "\"public_key\"",
+        "\"algorithm\"",
+        "\u{0}",
+        " ",
+        "\"AAAA\"",
+        "\"a.b\"",
+        "\"9999999999999999999999999999999999999999\"",
+        "{\"type\":\"x\"}",
+    ];
+    let paths = [
+        "/v1/challenges".to_owned(),
+        format!("/v1/challenges/{id}/approvals"),
+        "/v1/challenges/ch_nope/approvals".to_owned(),
+        "/v1/receipts/consume".to_owned(),
+        "/v1/enrollments/nope".to_owned(),
+    ];
+    for round in 0..1500 {
+        let mut body = String::new();
+        for _ in 0..(next() % 14) {
+            body.push_str(pieces[(next() % pieces.len() as u64) as usize]);
+        }
+        // Half the time, start from something well formed and damage it.
+        if round % 2 == 0 {
+            body = format!("{{\"idempotency_key\":\"f{round}\",\"action\":{{\"type\":\"withdraw\",\"amount\":{body}}}}}");
+        }
+        let path = &paths[(next() % paths.len() as u64) as usize];
+        let key = (next() % 3 != 0).then_some(app.key.as_str());
+        let (status, _, _) = send(&app, post(path, key, &body)).await;
+        assert!(
+            !status.is_server_error(),
+            "{status} for POST {path} with body {body:?}"
+        );
+    }
+    for path in [
+        "/v1/challenges/%00",
+        "/v1/approvals/%ff%fe",
+        "/approve/..%2f..%2fetc",
+        "/v1/challenges/x?wait=99999999999999999999",
+    ] {
+        let (status, _, _) = send(&app, get(path, Some(&app.key))).await;
+        assert!(!status.is_server_error(), "{status} for GET {path}");
+    }
+    assert!(app.service.audit_verify().is_ok());
+}

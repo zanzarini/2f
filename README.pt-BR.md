@@ -124,7 +124,7 @@ Exemplo completo em [examples/policy.json](examples/policy.json).
 | **Amarrado à ação** | Comprovantes e aprovações cobrem o SHA-256 de uma forma canônica. Mudou um dígito do valor, nada mais confere. |
 | **Nada para roubar no banco** | Só chaves públicas e hashes. A chave de assinatura fica fora dele. |
 | **Nada para plantar no banco** | Credenciais, chaves de API, regras, links de cadastro e cada pedido levam um selo da chave do servidor. Linha escrita por outra pessoa é ignorada; regra adulterada nega tudo; aprovação plantada não conta. |
-| **Auditoria assinada** | Encadeada e assinada entrada por entrada. `twof audit verify` aponta edições, exclusões e permissões que o registro não explica. |
+| **O registro decide** | Encadeado e assinado entrada por entrada. O servidor tira dele o que está valendo, então credencial revogada ou regra substituída não volta pelas tabelas, e ele para se o registro for cortado ou alterado. `twof audit verify` aponta o que o registro não explica. |
 | **Não confia em si mesmo** | O cliente pode fixar as chaves de dispositivo e de co-assinador e conferir as assinaturas dentro do comprovante, e a página e o aprovador de terminal recalculam o que assinam, então nem um servidor 2F invadido inventa uma dessas aprovações. |
 | **Rápido** | Gravação em lote e leituras em paralelo: cerca de 3.000 autorizações duráveis por segundo e 450.000 leituras por segundo na [medição](docs/ARCHITECTURE.md#7-why-it-is-fast), em um notebook. |
 

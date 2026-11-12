@@ -36,20 +36,30 @@ impl RelyingParty {
         if scheme != "https" && scheme != "http" {
             return None;
         }
-        let authority = rest.split('/').next()?;
-        let host = authority.rsplit_once(':').map_or(authority, |(h, port)| {
-            if port.bytes().all(|b| b.is_ascii_digit()) {
-                h
-            } else {
-                authority
-            }
-        });
-        if host.is_empty() || authority.contains('@') {
+        // Browsers report the origin in lower case and without the default
+        // port. Written any other way it would never match, and every
+        // approval would be refused.
+        let authority = rest.split('/').next()?.to_ascii_lowercase();
+        if authority.contains('@') || authority.chars().any(char::is_whitespace) {
             return None;
         }
+        let default_port = if scheme == "https" { "443" } else { "80" };
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                (host, Some(port))
+            }
+            _ => (authority.as_str(), None),
+        };
+        if host.is_empty() {
+            return None;
+        }
+        let origin = match port {
+            Some(port) if port != default_port => format!("{scheme}://{host}:{port}"),
+            _ => format!("{scheme}://{host}"),
+        };
         Some(RelyingParty {
             id: host.to_owned(),
-            origin: format!("{scheme}://{authority}"),
+            origin,
         })
     }
 }
@@ -353,11 +363,27 @@ mod tests {
             (local.id.as_str(), local.origin.as_str()),
             ("localhost", "http://localhost:8722")
         );
+        let party = |url: &str| RelyingParty::from_url(url).unwrap();
+        assert_eq!(
+            party("https://2F.Example.com:443/x").origin,
+            "https://2f.example.com"
+        );
+        assert_eq!(
+            party("http://2f.example.com:80").origin,
+            "http://2f.example.com"
+        );
+        assert_eq!(
+            party("https://2f.example.com:8443").origin,
+            "https://2f.example.com:8443"
+        );
+        assert_eq!(party("https://2f.example.com:8443").id, "2f.example.com");
         for bad in [
             "localhost:8722",
             "ftp://x.com",
             "https://",
             "https://user@evil.com",
+            "https://:443",
+            "https://a b.com",
         ] {
             assert!(RelyingParty::from_url(bad).is_none(), "{bad}");
         }

@@ -85,6 +85,19 @@ pub fn next_entry(
     })
 }
 
+/// True when `entry` is exactly what follows `prev` (`None` at the start):
+/// the next sequence number, linked to the previous hash, and hashing right.
+pub fn follows(prev: Option<(u64, &str)>, entry: &Entry) -> bool {
+    let (seq, prev_hash) = match prev {
+        Some((seq, hash)) => (seq + 1, hash),
+        None => (1, GENESIS),
+    };
+    entry.seq == seq
+        && entry.prev == prev_hash
+        && entry_hash(entry.seq, entry.ts, &entry.kind, &entry.data, &entry.prev)
+            .is_ok_and(|hash| hash == entry.hash)
+}
+
 /// Verifies a whole chain from the first entry. Returns the head `(seq, hash)`.
 pub fn verify_chain<'a>(
     entries: impl IntoIterator<Item = &'a Entry>,
@@ -181,6 +194,19 @@ mod tests {
             out.push(entry);
         }
         out
+    }
+
+    #[test]
+    fn follows_accepts_only_the_true_next_entry() {
+        let c = chain(3);
+        assert!(follows(None, &c[0]));
+        assert!(follows(Some((1, &c[0].hash)), &c[1]));
+        assert!(!follows(None, &c[1]));
+        assert!(!follows(Some((1, &c[0].hash)), &c[2]));
+        assert!(!follows(Some((1, &c[1].hash)), &c[1]));
+        let mut edited = c[1].clone();
+        edited.data = json!({ "i": 9 });
+        assert!(!follows(Some((1, &c[0].hash)), &edited));
     }
 
     #[test]

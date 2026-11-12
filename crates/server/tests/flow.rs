@@ -626,30 +626,16 @@ fn a_leaked_database_cannot_issue_receipts_or_call_the_api() {
     );
 
     let attacker = Service::open(&path, ServerKey::generate(), Config::default()).unwrap();
-    // With their own key the sealed policy and API key are not recognised.
-    assert!(matches!(
-        attacker.authenticate(&api_key),
-        Err(Error::Unauthorized)
-    ));
-    let refused = attacker
+    // With any other key the log is not theirs to continue: nothing works.
+    assert!(attacker.authenticate(&api_key).is_err());
+    assert!(attacker
         .create_challenge(&project, action.clone(), "k2", T0)
-        .unwrap();
-    assert_eq!(refused.state, "denied");
-    // Even after sealing a policy of their own, what they sign is not ours.
-    attacker.set_policy(&project, POLICY, T0).unwrap();
-    let forged = attacker
-        .create_challenge(&project, action.clone(), "k3", T0)
-        .unwrap()
-        .receipt
-        .unwrap();
-    let real_key = real.key();
-    let lookup = |kid: &str| (kid == real_key.kid()).then(|| real_key.public());
-    let parsed = Action::from_value(action).unwrap();
-    assert_eq!(
-        receipt::verify(&forged, &lookup, &parsed, T0),
-        Err(receipt::ReceiptError::UnknownKey)
-    );
-    assert!(real.consume_receipt(&project, &forged, T0).is_err());
+        .is_err());
+    assert!(attacker.set_policy(&project, POLICY, T0).is_err());
+    assert!(attacker.create_api_key(&project, "theirs", T0).is_err());
+    // The real server is unaffected.
+    assert_eq!(real.authenticate(&api_key).unwrap(), project);
+    assert!(real.audit_verify().is_ok());
 }
 
 #[test]

@@ -17,6 +17,9 @@ CI runs the same commands.
 
 - **A claim needs a test.** If a change adds a defence, add the test that
   attacks it. If it changes a row of `docs/THREAT_MODEL.md`, update the row.
+- **The model test must agree.** `crates/server/tests/model.rs` runs random
+  operations against an independent model of the rules. A change in behaviour
+  means changing the model on purpose, in the same commit.
 - **Fail closed.** When something cannot be parsed, read or verified, the
   answer is no.
 - **No new cryptography.** Ed25519, ECDSA P-256 and SHA-256, through audited

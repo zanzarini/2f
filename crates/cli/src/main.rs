@@ -262,7 +262,11 @@ fn restrict(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        // The database and the files SQLite keeps beside it.
+        for suffix in ["", "-wal", "-shm"] {
+            let file = format!("{}{suffix}", path.display());
+            let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
+        }
     }
     #[cfg(not(unix))]
     let _ = path;

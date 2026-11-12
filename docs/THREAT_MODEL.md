@@ -23,8 +23,8 @@ of the table has tests behind it; the file is named in the last column.
 | Stolen client API key | Create challenges and read their status | Cannot approve. Anything outside the auto-allow rules still needs an approver signature. Damage is bounded by the policy limits and velocity caps. Approvers cannot be buried in requests until one slips through: a project has a small limit of approvals waiting at once (`--max-pending`, 20 by default). | `flow.rs` |
 | A careless or hostile network path to the server | Read or redirect what the client sends | The SDKs refuse plain HTTP except to the local machine, so the API key is not sent in the clear, and they do not follow redirects, which would carry the key elsewhere. | SDK tests |
 | The same authorization acted on twice | Retry after a crash, or replay a response | `authorize` in the SDKs marks the receipt as used before returning. A second attempt with the same idempotency key gets "conflict" instead of a second go-ahead. | SDK tests, `flow.rs` |
-| Database copy leaked (read) | Read public keys, API key hashes, history | Cannot approve (no private keys), cannot call the API (hashes only), cannot issue receipts (the signing key is not there). | `flow.rs` |
-| Database write access | Insert, edit or delete rows | Cannot grant themselves power. Credentials, API keys, policies, enrollment links, notification settings and every challenge (its state, requirements and deadline) are sealed with the server key; a row without a valid seal is ignored or refused, and an edited policy fails closed to "deny everything". A planted approval does not count: each stored signature is verified again when the quorum is counted. The approver is never shown an action other than the one whose hash is signed. A decided challenge or a used receipt cannot be put back while the server runs. Notifications planted or redirected in the queue are not sent. The audit log cannot be extended (every entry is signed), and `twof audit verify` reports rows that no longer match it: grants, policies, challenge states, used receipts. | `tamper.rs`, `channels.rs` |
+| Database copy leaked (read) | Read public keys, API key hashes, history | Cannot approve (no private keys), cannot call the API (hashes only), cannot issue receipts (the signing key is not there). A server started on that file with any other key refuses to operate at all. | `flow.rs` |
+| Database write access | Insert, edit or delete rows | Cannot grant themselves power. Credentials, API keys, policies, enrollment links, notification settings and every challenge (its state, requirements and deadline) are sealed with the server key; a row without a valid seal is ignored or refused, and an edited policy fails closed to "deny everything". A planted approval does not count: each stored signature is verified again when the quorum is counted. The approver is never shown an action other than the one whose hash is signed. A decided challenge, a used receipt, a revoked credential or API key and a replaced policy cannot be put back, even with their genuine old seals: what is in force is taken from the signed log, and the server stops if the log is cut, altered or extended by anyone else. Notifications planted or redirected in the queue are not sent. The audit log cannot be extended (every entry is signed), and `twof audit verify` reports rows that no longer match it: grants, policies, challenge states, used receipts. | `tamper.rs`, `channels.rs` |
 | Network attacker or tampering client | Replay or alter requests | Receipts bind the hash of the canonical action; changing amount or destination invalidates them. Receipts expire in minutes and are consumed once. Approvals are bound to one challenge. | `flow.rs`, core |
 | Phishing an approver | Show a fake page | Passkeys are bound to the real origin, so a look-alike site cannot obtain a usable signature. The signature covers the action hash, so approving A cannot be reused for B. | `passkey.rs` |
 | Misleading the approver's screen | Send text that displays as something else | Invisible and text reordering characters are rejected in every field shown. Free form notes are displayed apart from amount and destination. | core `action` |
@@ -62,13 +62,22 @@ Stated plainly so nobody relies on something that is not there.
 - **Cutting the end off the audit log** is only detected against a checkpoint
   kept somewhere the server cannot write. Run `twof audit checkpoint` on a
   schedule and store the output elsewhere.
-- **Putting back an old version of a row.** A seal proves this server wrote
-  a row, not that it is the newest version. Someone with write access who
-  saved a credential before it was revoked, or a policy before it was
-  tightened, can restore it with its genuine seal. For challenges and receipts
-  the running server remembers what it has seen decided or used and refuses
-  the old version; for credentials and policies, which are changed from the
-  command line, only `twof audit verify` reports it. Run it on a schedule.
+- **Cutting the log while the server is stopped.** While it runs, the server
+  takes what is in force (credentials, API keys, policies) from the signed
+  log, remembers the last entry it read, and stops if the log turns out
+  shorter, different or extended by anyone else. So a revoked credential or a
+  replaced policy cannot be put back, even with its genuine old seal. What
+  remains is the moment of starting: a server that starts on a log whose end
+  was cut off cannot know, unless the database still holds a checkpoint from
+  after the cut, or you compare with one you stored elsewhere. Run `twof audit
+  checkpoint` on a schedule and keep the output outside the machine.
+- **Stopping the server is easy for whoever can write to the database.**
+  Damaging the log makes the server refuse to operate. That is the intended
+  direction of failure, but it is an outage.
+- **A stolen API key can use up the waiting room.** The limit of approvals
+  waiting at once protects approvers from being flooded; the price is that
+  whoever holds a project's key can keep that project's queue full. Revoke the
+  key (`twof apikey revoke-all`).
 - **History based limits.** Velocity caps are computed from stored
   challenges. Deleting rows resets them; the audit check shows the deletion.
 - **Pinned approvers cover keys, not passkeys.** The SDKs verify device key

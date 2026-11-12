@@ -21,6 +21,7 @@
       extra: "Notes sent by the requesting system",
       tampered: "This request failed an integrity check. Nothing can be signed. Tell whoever runs the server.",
       unusual: "Contains unusual characters. Compare it carefully.",
+      closed: "This request is no longer waiting: it was already decided or has expired.",
       enrollHint: "Your device will ask for your fingerprint, face or PIN. The key never leaves it.",
       approver: "Approver",
     },
@@ -41,6 +42,7 @@
       extra: "Observações enviadas pelo sistema solicitante",
       tampered: "Este pedido falhou na conferência de integridade. Nada pode ser assinado. Avise quem cuida do servidor.",
       unusual: "Contém caracteres incomuns. Compare com cuidado.",
+      closed: "Este pedido não está mais aguardando: já foi decidido ou expirou.",
       enrollHint: "Seu dispositivo vai pedir digital, rosto ou PIN. A chave nunca sai dele.",
       approver: "Aprovador",
     },
@@ -148,7 +150,7 @@
     $("project").textContent = data.project_name;
     const action = data.action;
     const intact = await consistent(data, id);
-    row(t.type, action.type);
+    warnIfUnusual(row(t.type, action.type), action.type);
     if (action.amount !== undefined) {
       row(t.amount, action.amount + (action.asset ? " " + action.asset : ""), "big");
     } else if (action.asset !== undefined) {
@@ -204,7 +206,7 @@
           if (state === "rejected") return finish(t.rejected, "ok");
           return finish(t.waiting, "ok");
         }
-        if (result.status === 409) { clearInterval(timer); return finish(t.state.expired, "error"); }
+        if (result.status === 409) { clearInterval(timer); return finish(t.closed, "error"); }
         setStatus(result.status === 403 ? t.refused : t.failed, "error");
       } catch (error) {
         setStatus(error && error.name === "NotAllowedError" ? t.cancelled : t.failed, "error");

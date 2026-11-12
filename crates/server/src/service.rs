@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -354,6 +354,33 @@ fn credential_fields(
             "kind": kind, "public_key": public_key, "external_id": external_id })
 }
 
+/// What the signed audit log says is in force right now.
+///
+/// The tables are where grants are looked up, but the log is what decides.
+/// A seal shows that this server wrote a row; it cannot show that the row is
+/// the latest word. A credential that was revoked, or a policy that was
+/// replaced, could be put back in the table exactly as it once was. The log
+/// cannot be rolled back that way without this process noticing: it remembers
+/// the last entry it read, every new entry must follow it and be signed, and
+/// the log turning out shorter or different than remembered stops everything.
+#[derive(Default)]
+struct Ledger {
+    seq: u64,
+    hash: String,
+    /// The last entries read, so an older read snapshot is told apart from a
+    /// log that went backwards.
+    recent: VecDeque<(u64, String)>,
+    /// credential id -> (project, approver, kind, public key)
+    credentials: HashMap<String, CredentialRecord>,
+    /// (project, key id)
+    api_keys: HashSet<(String, String)>,
+    /// project -> canonical JSON of its policy
+    policies: HashMap<String, String>,
+    broken: Option<String>,
+}
+
+const LEDGER_RECENT: usize = 8192;
+
 /// The parts of the service that operations need while they run.
 struct Inner {
     key: ServerKey,
@@ -367,6 +394,7 @@ struct Inner {
     /// someone who saved a "pending" row could put it back after a refusal.
     /// This memory, which is not in the database, refuses that.
     closed: Mutex<HashMap<String, u64>>,
+    ledger: Mutex<Ledger>,
 }
 
 impl Inner {
@@ -520,7 +548,15 @@ impl Inner {
                 &public_key,
                 external_id.as_deref(),
             );
-            if !self.sealed(&fields, seal.as_deref()) {
+            if !self.sealed(&fields, seal.as_deref())
+                || !self.granted(
+                    &credential,
+                    &row.project,
+                    &approver,
+                    &kind_text,
+                    &public_key,
+                )
+            {
                 continue;
             }
             let mut hasher = Sha256::new();
@@ -560,6 +596,197 @@ impl Inner {
         }
     }
 
+    /// Brings the ledger up to date with the log as `conn` sees it. Fails,
+    /// and keeps failing, if the log does not continue from what was last
+    /// read or holds an entry this server did not sign.
+    ///
+    /// `latest` says the connection is known to show the newest committed
+    /// state (the writer does). There, a log shorter than remembered has been
+    /// cut. A reader may simply have started before the newest writes, so for
+    /// it an earlier point of the same history is accepted.
+    fn sync(&self, conn: &Connection, latest: bool) -> Result<()> {
+        let mut ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(reason) = &ledger.broken {
+            return Err(Error::Internal(reason.clone()));
+        }
+        let head = one(
+            conn,
+            "SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+        )?;
+        let (seq, hash) = head.unwrap_or((0, String::new()));
+        if seq == ledger.seq && (seq == 0 || hash == ledger.hash) {
+            return Ok(());
+        }
+        let stop = |ledger: &mut Ledger, why: &str| {
+            let reason = format!("the audit log cannot be trusted ({why}); refusing to operate");
+            eprintln!("error: {reason}");
+            ledger.broken = Some(reason.clone());
+            Err(Error::Internal(reason))
+        };
+        if seq <= ledger.seq {
+            // A read that started before the latest writes sees an earlier
+            // point of the same history. Anything else is a rewritten log.
+            if !latest && ledger.recent.iter().any(|(s, h)| *s == seq && *h == hash) {
+                return Ok(());
+            }
+            return stop(
+                &mut ledger,
+                "it is shorter or different from what was read before",
+            );
+        }
+
+        // On a first read, a checkpoint this server signed vouches for
+        // everything up to it, which saves verifying each of those signatures.
+        let mut vouched: Option<(u64, String)> = None;
+        if ledger.seq == 0 {
+            for checkpoint in read_checkpoints(conn)? {
+                let ours =
+                    checkpoint.kid == self.key.kid() && checkpoint.signature_valid(&self.public);
+                if ours && vouched.as_ref().is_none_or(|(s, _)| checkpoint.seq > *s) {
+                    vouched = Some((checkpoint.seq, checkpoint.hash));
+                }
+            }
+        }
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, ts, kind, data, prev, hash, sig FROM audit WHERE seq > ? ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([ledger.seq as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        for row in rows {
+            let (seq, ts, kind, data, prev, hash, sig) = row?;
+            let Ok(data) = canonical::parse_strict(&data) else {
+                return stop(&mut ledger, "an entry is unreadable");
+            };
+            let entry = Entry {
+                seq,
+                ts,
+                kind,
+                data,
+                prev,
+                hash,
+            };
+            let previous = (ledger.seq > 0).then(|| (ledger.seq, ledger.hash.as_str()));
+            if !audit::follows(previous, &entry) {
+                return stop(&mut ledger, "an entry does not follow the one before it");
+            }
+            match &vouched {
+                Some((at, expected)) if entry.seq <= *at => {
+                    if entry.seq == *at && entry.hash != *expected {
+                        return stop(&mut ledger, "it does not match a signed checkpoint");
+                    }
+                }
+                _ => {
+                    // Entries this process signed itself are recognised
+                    // without checking the signature again.
+                    let known = self.remembered(&entry_digest(&entry.hash, &sig));
+                    if !known && !audit::entry_signature_valid(&self.public, &entry.hash, &sig) {
+                        return stop(&mut ledger, "an entry was not signed by this server");
+                    }
+                }
+            }
+            self.apply(&mut ledger, &entry);
+            ledger.seq = entry.seq;
+            ledger.hash = entry.hash.clone();
+            ledger.recent.push_back((entry.seq, entry.hash));
+            if ledger.recent.len() > LEDGER_RECENT {
+                ledger.recent.pop_front();
+            }
+        }
+        if vouched.is_some_and(|(at, _)| at > ledger.seq) {
+            return stop(&mut ledger, "it is shorter than a signed checkpoint");
+        }
+        Ok(())
+    }
+
+    /// Applies one log entry to what is in force.
+    fn apply(&self, ledger: &mut Ledger, entry: &Entry) {
+        let text = |field: &str| entry.data[field].as_str().unwrap_or("").to_owned();
+        // Decisions and uses stay in memory for as long as they could matter.
+        let horizon = self
+            .config
+            .challenge_ttl
+            .saturating_add(self.config.receipt_ttl)
+            + 600;
+        let until = entry.ts.saturating_add(horizon);
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        match entry.kind.as_str() {
+            "project.created" => {
+                let nothing = serde_json::to_value(Policy::deny_all())
+                    .ok()
+                    .and_then(|v| canonical::to_canonical(&v).ok())
+                    .unwrap_or_default();
+                ledger.policies.insert(text("project"), nothing);
+            }
+            "policy.set" => {
+                let policy = canonical::to_canonical(&entry.data["policy"]).unwrap_or_default();
+                ledger.policies.insert(text("project"), policy);
+            }
+            "credential.added" => {
+                ledger.credentials.insert(
+                    text("credential"),
+                    (
+                        text("project"),
+                        text("approver"),
+                        text("kind"),
+                        text("public_key"),
+                    ),
+                );
+            }
+            "credential.revoked" => {
+                ledger.credentials.remove(&text("credential"));
+            }
+            "approver.disabled" => {
+                let (project, approver) = (text("project"), text("approver"));
+                ledger
+                    .credentials
+                    .retain(|_, c| !(c.0 == project && c.1 == approver));
+            }
+            "apikey.created" => {
+                ledger.api_keys.insert((text("project"), text("key")));
+            }
+            "apikey.revoked_all" => {
+                let project = text("project");
+                ledger.api_keys.retain(|(p, _)| *p != project);
+            }
+            "challenge.rejected" | "challenge.expired" | "receipt.issued" if until >= wall => {
+                self.close(&text("challenge"), until, wall);
+            }
+            "receipt.consumed" if until >= wall => {
+                self.close(&text("receipt"), until, wall);
+            }
+            _ => {}
+        }
+    }
+
+    /// True when the log says this credential is in force, with this key.
+    fn granted(
+        &self,
+        id: &str,
+        project: &str,
+        approver: &str,
+        kind: &str,
+        public_key: &str,
+    ) -> bool {
+        let ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        ledger.broken.is_none()
+            && ledger.credentials.get(id).is_some_and(|c| {
+                c.0 == project && c.1 == approver && c.2 == kind && c.3 == public_key
+            })
+    }
+
     fn approve_url(&self, challenge: &str) -> String {
         format!(
             "{}/approve/{challenge}",
@@ -580,6 +807,8 @@ impl Inner {
             .as_ref()
             .map(|(seq, hash)| (*seq as u64, hash.as_str()));
         let entry = audit::next_entry(prev_ref, now, kind, data)?;
+        let sig = audit::sign_entry(&self.key, &entry.hash);
+        self.remember(entry_digest(&entry.hash, &sig));
         exec(
             conn,
             "INSERT INTO audit (seq, ts, kind, data, prev, hash, sig) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -590,7 +819,7 @@ impl Inner {
                 canonical::to_canonical(&entry.data)?,
                 entry.prev,
                 entry.hash,
-                audit::sign_entry(&self.key, &entry.hash)
+                sig
             ],
         )?;
         Ok(())
@@ -607,6 +836,20 @@ impl Inner {
         )?
         .ok_or(Error::NotFound)?;
         if !self.sealed(&policy_fields(project, &text), seal.as_deref()) {
+            return Ok(Policy::deny_all());
+        }
+        // The row must also be the policy the log last recorded, not an
+        // earlier one put back with its old seal.
+        let stored = canonical::parse_strict(&text)
+            .ok()
+            .and_then(|value| canonical::to_canonical(&value).ok());
+        let current = {
+            let ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+            ledger.broken.is_none()
+                && stored.is_some()
+                && ledger.policies.get(project) == stored.as_ref()
+        };
+        if !current {
             return Ok(Policy::deny_all());
         }
         Ok(Policy::parse(&text).unwrap_or_else(|_| Policy::deny_all()))
@@ -631,7 +874,7 @@ impl Inner {
             approvals,
             binding_expires_at: row.expires_at,
             issued_at: now,
-            expires_at: now + self.config.receipt_ttl,
+            expires_at: now.saturating_add(self.config.receipt_ttl),
             kid: self.key.kid(),
         };
         let token = payload.issue(&self.key);
@@ -714,7 +957,6 @@ impl Inner {
                 params![now as i64, row.id],
             )?;
             row.state = "expired".into();
-            self.close(&row.id, row.expires_at, now);
             self.reseal(conn, &mut row)?;
             self.audit(
                 conn,
@@ -729,6 +971,8 @@ impl Inner {
                 "challenge.expired",
                 json!({ "challenge": row.id }),
             )?;
+            // Last, so a failure above does not leave the memory ahead of the table.
+            self.close(&row.id, row.expires_at, now);
         }
         Ok(row)
     }
@@ -849,6 +1093,15 @@ fn fetch(conn: &Connection, id: &str) -> Result<ChallengeRow> {
         },
     )?
     .ok_or(Error::NotFound)
+}
+
+fn entry_digest(hash: &str, sig: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"audit ");
+    hasher.update(hash.as_bytes());
+    hasher.update([0]);
+    hasher.update(sig.as_bytes());
+    hasher.finalize().into()
 }
 
 fn seal_digest(fields: &Value, seal: &str) -> [u8; 32] {
@@ -1002,10 +1255,35 @@ fn read_state(conn: &Connection) -> Result<StoredState> {
     let api_keys = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let mut stmt = conn.prepare_cached("SELECT id, state FROM challenges")?;
-    let challenges = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
+    let mut stmt = conn
+        .prepare_cached("SELECT id, state, action, action_hash, amount, asset FROM challenges")?;
+    let mut challenges = BTreeMap::new();
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, state, action, action_hash, amount, asset) = row?;
+        // The amount and asset columns feed the velocity limits: they must be
+        // the ones of the action, and the action the one that was hashed.
+        let consistent = Action::parse(&action).is_ok_and(|parsed| {
+            parsed.hash_hex().is_ok_and(|hash| hash == action_hash)
+                && parsed.amount == amount
+                && parsed.asset == asset
+        });
+        let state = if consistent {
+            state
+        } else {
+            "altered".to_owned()
+        };
+        challenges.insert(id, format!("{state} {action_hash}"));
+    }
     let mut stmt = conn.prepare_cached("SELECT id FROM receipts WHERE consumed_at IS NOT NULL")?;
     let consumed = stmt
         .query_map([], |r| r.get(0))?
@@ -1036,23 +1314,32 @@ pub struct Service {
 
 impl Service {
     pub fn open(path: &Path, key: ServerKey, config: Config) -> Result<Self> {
-        Self::with_store(Store::open(Some(path), SCHEMA)?, key, config)
+        Self::build(Some(path), key, config)
     }
 
     pub fn open_in_memory(key: ServerKey, config: Config) -> Result<Self> {
-        Self::with_store(Store::open(None, SCHEMA)?, key, config)
+        Self::build(None, key, config)
     }
 
-    fn with_store(store: Store, key: ServerKey, config: Config) -> Result<Self> {
-        let inner = Inner {
+    fn build(path: Option<&Path>, key: ServerKey, config: Config) -> Result<Self> {
+        let inner = Arc::new(Inner {
             public: key.public(),
             key,
             config: config.clone(),
             verified: Mutex::new(HashSet::new()),
             closed: Mutex::new(HashMap::new()),
-        };
+            ledger: Mutex::new(Ledger::default()),
+        });
+        // Every batch of writes starts by reading the log, so nothing is
+        // decided on grants the log no longer supports.
+        let watcher = inner.clone();
+        let store = Store::open(
+            path,
+            SCHEMA,
+            Box::new(move |conn| watcher.sync(conn, true).is_ok()),
+        )?;
         Ok(Service {
-            inner: Arc::new(inner),
+            inner,
             store,
             config,
         })
@@ -1323,7 +1610,7 @@ impl Service {
         rand::rngs::OsRng.fill_bytes(&mut challenge);
         let challenge = B64.encode(challenge);
         let hash = token_hash(&token);
-        let expires_at = now + ENROLLMENT_TTL;
+        let expires_at = now.saturating_add(ENROLLMENT_TTL);
         let (inner, project, approver) =
             (self.inner.clone(), project.to_owned(), approver.to_owned());
         self.store.write(move |conn| {
@@ -1449,6 +1736,7 @@ impl Service {
     pub fn authenticate(&self, token: &str) -> Result<String> {
         let (inner, hash) = (self.inner.clone(), token_hash(token));
         self.store.read(move |conn| {
+            inner.sync(conn, false)?;
             let (project, id, seal) = one(
                 conn,
                 "SELECT project, id, seal FROM api_keys WHERE hash = ? AND revoked_at IS NULL",
@@ -1462,8 +1750,13 @@ impl Service {
                 },
             )?
             .ok_or(Error::Unauthorized)?;
-            // A row someone wrote into the table without the signing key is not a key.
-            if !inner.sealed(&apikey_fields(&project, &id, &hash), seal.as_deref()) {
+            // A row someone wrote into the table without the signing key is not
+            // a key, and neither is one the log says was revoked.
+            let in_force = {
+                let ledger = inner.ledger.lock().unwrap_or_else(|p| p.into_inner());
+                ledger.api_keys.contains(&(project.clone(), id.clone()))
+            };
+            if !in_force || !inner.sealed(&apikey_fields(&project, &id, &hash), seal.as_deref()) {
                 return Err(Error::Unauthorized);
             }
             Ok(project)
@@ -1527,7 +1820,7 @@ impl Service {
                 }
             };
             let id = new_id("ch");
-            let expires_at = now + inner.config.challenge_ttl;
+            let expires_at = now.saturating_add(inner.config.challenge_ttl);
             let decided_at = (state != "pending").then_some(now as i64);
             exec(
                 conn,
@@ -1706,7 +1999,9 @@ impl Service {
                 &public_key,
                 external_id.as_deref(),
             );
-            if !inner.sealed(&fields, seal.as_deref()) {
+            if !inner.sealed(&fields, seal.as_deref())
+                || !inner.granted(&credential, &row.project, &approver, &kind_text, &public_key)
+            {
                 return Err(denied());
             }
             let kind = ApproverKind::parse(&kind_text)
@@ -1740,7 +2035,6 @@ impl Service {
                     params![now as i64, row.id],
                 )?;
                 row.state = "rejected".into();
-                inner.close(&row.id, row.expires_at, now);
                 inner.reseal(conn, &mut row)?;
                 inner.audit(conn, now, "challenge.rejected", evidence)?;
                 inner.emit(
@@ -1750,14 +2044,26 @@ impl Service {
                     "challenge.rejected",
                     json!({ "challenge": row.id, "approver": approver }),
                 )?;
+                inner.close(&row.id, row.expires_at, now);
             } else {
-                let inserted = exec(
+                // The proof was just verified, so it replaces whatever is
+                // stored for this credential. Otherwise a junk row planted
+                // beforehand would keep the real approval from ever counting.
+                let previous = one(
                     conn,
-                    "INSERT OR IGNORE INTO approvals (challenge, approver, credential, kind, sig, created_at) \
-                     VALUES (?, ?, ?, ?, ?, ?)",
-                    params![row.id, approver, credential, kind.as_str(), stored_proof, now as i64],
+                    "SELECT sig FROM approvals WHERE challenge = ? AND credential = ?",
+                    params![row.id, credential],
+                    |r| r.get::<_, String>(0),
                 )?;
-                if inserted == 1 {
+                if previous.as_deref() != Some(stored_proof.as_str()) {
+                    exec(
+                        conn,
+                        "INSERT INTO approvals (challenge, approver, credential, kind, sig, created_at) \
+                         VALUES (?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT (challenge, credential) DO UPDATE SET \
+                         approver = excluded.approver, kind = excluded.kind, sig = excluded.sig",
+                        params![row.id, approver, credential, kind.as_str(), stored_proof, now as i64],
+                    )?;
                     inner.audit(conn, now, "approval.accepted", evidence)?;
                 }
                 // Every stored approval is verified again here, so only real
@@ -1783,7 +2089,6 @@ impl Service {
                         params![now as i64, row.id],
                     )?;
                     row.state = "approved".into();
-                    inner.close(&row.id, row.expires_at, now);
                     inner.reseal(conn, &mut row)?;
                     inner.emit(
                         conn,
@@ -1795,6 +2100,7 @@ impl Service {
                     let token =
                         inner.issue_receipt(conn, &row, ReceiptDecision::Approved, proofs, now)?;
                     row.receipt = Some(token);
+                    inner.close(&row.id, row.expires_at, now);
                 }
             }
             inner.view(conn, row)
@@ -1952,26 +2258,23 @@ impl Service {
                     expected.api_keys.retain(|(p, _)| *p != project);
                 }
                 "challenge.created" => {
-                    expected
-                        .challenges
-                        .insert(text(entry, "challenge"), text(entry, "state"));
+                    expected.challenges.insert(
+                        text(entry, "challenge"),
+                        format!("{} {}", text(entry, "state"), text(entry, "action_hash")),
+                    );
                 }
-                "challenge.rejected" => {
-                    expected
-                        .challenges
-                        .insert(text(entry, "challenge"), "rejected".into());
-                }
-                "challenge.expired" => {
-                    expected
-                        .challenges
-                        .insert(text(entry, "challenge"), "expired".into());
-                }
-                "receipt.issued" => {
-                    // A receipt for a challenge that was waiting means it was approved.
-                    if let Some(state) = expected.challenges.get_mut(&text(entry, "challenge")) {
-                        if state == "pending" {
-                            *state = "approved".into();
-                        }
+                "challenge.rejected" | "challenge.expired" | "receipt.issued" => {
+                    // Only the state moves; what the challenge was for never does.
+                    if let Some(record) = expected.challenges.get_mut(&text(entry, "challenge")) {
+                        let (state, hash) = record.split_once(' ').unwrap_or((record.as_str(), ""));
+                        let next = match entry.kind.as_str() {
+                            "challenge.rejected" => "rejected",
+                            "challenge.expired" => "expired",
+                            // A receipt for a challenge that was waiting means it was approved.
+                            _ if state == "pending" => "approved",
+                            _ => state,
+                        };
+                        *record = format!("{next} {hash}");
                     }
                 }
                 "receipt.consumed" => {

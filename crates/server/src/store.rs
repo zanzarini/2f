@@ -27,6 +27,9 @@ const MAX_BATCH: usize = 256;
 const MAX_READERS: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Called with the writer connection at the start of each batch.
+pub(crate) type BeginHook = Box<dyn Fn(&Connection) -> bool + Send>;
+
 struct Job {
     /// Runs the operation. Returns whether it succeeded.
     run: Box<dyn FnOnce(&Connection) -> bool + Send>,
@@ -49,7 +52,12 @@ fn stopped() -> Error {
 impl Store {
     /// Opens the database. `None` is a private in-memory database, where
     /// reads share the writer connection.
-    pub fn open(path: Option<&Path>, schema: &str) -> Result<Self> {
+    ///
+    /// `on_begin` runs at the start of every write batch and again right
+    /// after it commits: both moments when the writer connection shows exactly
+    /// what is committed. If it returns false at the start, the batch is
+    /// refused: nothing in it runs.
+    pub fn open(path: Option<&Path>, schema: &str, on_begin: BeginHook) -> Result<Self> {
         let writer = match path {
             Some(path) => Connection::open(path)?,
             None => Connection::open_in_memory()?,
@@ -85,7 +93,7 @@ impl Store {
         let notify = changed.clone();
         std::thread::Builder::new()
             .name("twof-writer".into())
-            .spawn(move || writer_loop(writer, queue, notify))
+            .spawn(move || writer_loop(writer, queue, notify, on_begin))
             .map_err(|e| Error::Internal(format!("cannot start the writer thread: {e}")))?;
         Ok(Store {
             jobs,
@@ -152,9 +160,10 @@ impl Store {
     }
 }
 
-fn writer_loop(conn: Connection, queue: Receiver<Job>, changed: Arc<Notify>) {
+fn writer_loop(conn: Connection, queue: Receiver<Job>, changed: Arc<Notify>, on_begin: BeginHook) {
     while let Ok(first) = queue.recv() {
-        let mut healthy = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
+        let mut healthy = conn.execute_batch("BEGIN IMMEDIATE").is_ok()
+            && matches!(catch_unwind(AssertUnwindSafe(|| on_begin(&conn))), Ok(true));
         let mut finishes = Vec::new();
         let mut next = Some(first);
         while let Some(job) = next.take() {
@@ -184,6 +193,9 @@ fn writer_loop(conn: Connection, queue: Receiver<Job>, changed: Arc<Notify>) {
             finish(committed);
         }
         if committed {
+            // Let the service read what was just written before anything
+            // else can touch the file.
+            let _ = catch_unwind(AssertUnwindSafe(|| on_begin(&conn)));
             changed.notify_waiters();
         }
     }
