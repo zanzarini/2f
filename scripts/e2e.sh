@@ -11,7 +11,7 @@ WORK="$(mktemp -d)"
 export TWOF_DB="$WORK/twof.db" TWOF_KEY_FILE="$WORK/twof.key"
 SERVER_PID=""
 COSIGN_PID=""
-trap 'kill $SERVER_PID $COSIGN_PID 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'kill $SERVER_PID $COSIGN_PID 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
 field() { python3 -c "import json,sys; v=json.load(sys.stdin)$1; print(v if v is not None else '')"; }
 status() { curl -s -o /dev/null -w '%{http_code}' "$@"; }

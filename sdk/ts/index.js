@@ -76,6 +76,11 @@ export function verifyReceipt(token, publicKeys, action, now = Math.floor(Date.n
   if (!key) throw new TwoFError("unknown_key", "receipt was signed by an unknown key");
   const message = Buffer.concat([Buffer.from("2F-RECEIPT-v1\n"), payloadBytes]);
   if (!ed25519Verify(key, message, signature)) throw new TwoFError("bad_signature", "receipt signature is invalid");
+  // A signed payload with fields of the wrong type must not slip through
+  // comparisons that are false for anything that is not a number.
+  if (!Number.isSafeInteger(payload.expires_at) || !Number.isSafeInteger(payload.issued_at) || typeof payload.action_hash !== "string") {
+    throw new TwoFError("malformed", "receipt is malformed");
+  }
   if (now > payload.expires_at) throw new TwoFError("expired", "receipt has expired");
   if (payload.issued_at > now + CLOCK_SKEW) throw new TwoFError("not_yet_valid", "receipt is not valid yet");
   const expected = Buffer.from(actionHash(action), "utf8");

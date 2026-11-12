@@ -5,47 +5,74 @@ the execution itself. The client asks 2F "may I do exactly this?", and only
 executes when it holds a valid receipt for exactly that action.
 
 Nothing here is "unbreakable". This document states what an attacker can and
-cannot do in each compromise scenario, so the claims can be checked.
+cannot do in each compromise scenario, so the claims can be checked. Each row
+of the table has tests behind it; the file is named in the last column.
 
 ## Assets
 
-- Approver private keys (passkeys, device Ed25519 keys). Never leave the device.
-- Server receipt signing key. Lives outside the database.
+- Approver private keys (passkeys, device keys, co-signer keys). Never leave
+  their owner.
+- Server signing key. Lives outside the database (key file or `TWOF_KEY`).
 - Project API keys. Only their SHA-256 is stored.
 - The audit log.
 
 ## Attackers and outcomes
 
-| Scenario | What the attacker gets | What still holds |
-|---|---|---|
-| Stolen client API key | Can create challenges and read their status | Cannot approve. Actions outside the auto-allow rules still need an approver signature. Damage is bounded by the policy limits and velocity caps. |
-| Database copy leaked | Public keys, API key hashes, history | Cannot approve (no private keys), cannot call the API (hashes only), cannot issue receipts (signing key is not in the database). |
-| Network attacker / tampering client | Can replay or alter requests | Receipts bind the SHA-256 of the canonical action. Changing amount or destination invalidates the receipt. Receipts expire quickly and are single use. |
-| Phishing an approver | Can show a fake page | Passkeys are origin bound, so a fake domain cannot obtain a signature. The signature covers the action hash, so approving A cannot be reused for B. |
-| Weak channel compromised (Telegram account, TOTP secret) | Can answer that channel | Weak channels only satisfy a requirement when the policy explicitly accepts `weak` strength. By default they only notify. |
-| Database write access | Can insert rows | Approvals are verified from signatures against enrolled public keys at issue time, and the audit chain makes edits and deletions detectable. Enrolling a new approver key by writing rows is the residual risk: see below. |
-| Full server compromise (code execution + signing key) | Can issue receipts | This defeats the receipt. Mitigations: clients may pin approver public keys and verify the approver signatures carried in the receipt themselves (`verify_with_pinned_approvers`), and may require an independent co-signer running on another machine. |
+| Scenario | What the attacker can do | What still holds | Tests |
+|---|---|---|---|
+| Stolen client API key | Create challenges and read their status | Cannot approve. Anything outside the auto-allow rules still needs an approver signature. Damage is bounded by the policy limits and velocity caps. | `flow.rs` |
+| Database copy leaked (read) | Read public keys, API key hashes, history | Cannot approve (no private keys), cannot call the API (hashes only), cannot issue receipts (the signing key is not there). | `flow.rs` |
+| Database write access | Insert, edit or delete rows | Cannot grant themselves power: credentials, API keys and policies are sealed with the server key and ignored without a valid seal. An edited policy fails closed to "deny everything". Cannot extend the audit log: every entry is signed. Edits, deletions and extra grants are reported by `twof audit verify`. | `tamper.rs` |
+| Network attacker or tampering client | Replay or alter requests | Receipts bind the hash of the canonical action; changing amount or destination invalidates them. Receipts expire in minutes and are consumed once. Approvals are bound to one challenge. | `flow.rs`, core |
+| Phishing an approver | Show a fake page | Passkeys are bound to the real origin, so a look-alike site cannot obtain a usable signature. The signature covers the action hash, so approving A cannot be reused for B. | `passkey.rs` |
+| Misleading the approver's screen | Send text that displays as something else | Invisible and text reordering characters are rejected in every field shown. Free form notes are displayed apart from amount and destination. | core `action` |
+| Stolen approver device, or a rogue approver | Approve as that person | Rules can require several distinct people or an independent co-signer. Disabling an approver revokes their credentials and their approvals on pending challenges stop counting. | `tamper.rs` |
+| Cloned passkey | Use a copy of an authenticator | A signature counter that fails to grow is refused. | `passkey.rs` |
+| Weak channel compromised (Telegram account) | Read notifications | Telegram only carries the link. It never approves. | `channels.rs` |
+| Compromised 2F server (code execution and signing key) | Issue receipts | This defeats the receipt on its own. Clients that pin approver public keys verify the approver signatures inside the receipt themselves, and an independent co-signer on another machine refuses to sign anything its own policy rejects, including a binding that does not match the action shown to it. | `channels.rs`, SDK tests |
 
 ## Design rules that follow
 
-1. Fail closed. No matching rule means deny. Any parsing ambiguity means reject.
+1. Fail closed. No matching rule means deny. A parsing ambiguity means reject.
+   A row with a bad seal does not exist.
 2. One canonical encoding. Actions are hashed from a strict canonical JSON
-   form (RFC 8785 subset without floating point numbers). Amounts are decimal
-   strings.
-3. Domain separation. Every signed or hashed structure is prefixed with a
-   distinct tag (`2F-ACTION-v1`, `2F-BINDING-v1`, `2F-RECEIPT-v1`,
-   `2F-AUDIT-v1`), so a signature for one purpose cannot be replayed as another.
-4. Approvers sign the binding, not a random nonce. The binding contains the
-   project, challenge id, action hash and expiry.
+   form (RFC 8785 without floating point numbers). Amounts are decimal
+   strings. Duplicate keys are rejected.
+3. Domain separation. Every signed or hashed structure carries its own tag
+   (`2F-ACTION-v1`, `2F-BINDING-v1`, `2F-REJECT-v1`, `2F-RECEIPT-v1`,
+   `2F-AUDIT-v1`, `2F-AUDIT-SIG-v1`, `2F-CHECKPOINT-v1`, `2F-SEAL-v1`,
+   `2F-WEBHOOK-v1`).
+4. Approvers sign the binding, not a random nonce: project, challenge, action
+   hash and expiry.
 5. No shared secrets for strong factors. The server stores public keys only.
-6. Enrollment is itself a protected action. After bootstrap, adding an
-   approver requires approval from an existing strong approver.
-7. No recovery by email or SMS. Recovery is by quorum of remaining approvers
-   or by an operator with local access to the machine (CLI), which is logged.
+6. Administration is local. Enrolling approvers, changing policies and
+   creating API keys happen through the CLI on the machine, never over HTTP.
+7. No recovery by email or SMS.
 8. Standard primitives only: Ed25519, ECDSA P-256 (WebAuthn), SHA-256.
+9. Authentication before parsing. Unauthenticated callers learn nothing from
+   later checks.
 
-## Out of scope
+## Known limits
 
-- Malware on the approver's device that alters what the screen shows.
-- A client that does not verify the receipt before executing.
-- Denial of service beyond basic rate limiting.
+Stated plainly so nobody relies on something that is not there.
+
+- **Cutting the end off the audit log** is only detected against a checkpoint
+  kept somewhere the server cannot write. Run `twof audit checkpoint` on a
+  schedule and store the output elsewhere.
+- **Replaying an old seal.** An attacker with write access who saved a
+  credential's seal before it was revoked can restore the row. `twof audit
+  verify` reports it; the server alone does not, because it would need to
+  replay the log on every approval.
+- **History based limits.** Velocity caps are computed from stored
+  challenges. Deleting rows resets them; the audit check shows the deletion.
+- **Key rotation** is not implemented. Seals and audit signatures are tied to
+  the one server key.
+- **The approver's own device.** Malware that changes what the screen shows
+  before the person confirms is outside what a server can prevent.
+- **A client that skips verification.** The receipt only protects a client
+  that checks it before executing.
+- **Denial of service** is limited to per address rate limiting. Put the
+  server behind a proxy that does more if you need it.
+- **Real device coverage.** Passkey verification is tested against a software
+  authenticator that follows the WebAuthn specification, not yet against a
+  matrix of real phones and browsers.

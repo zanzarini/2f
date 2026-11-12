@@ -12,6 +12,7 @@ pub mod keys;
 pub mod passkey;
 pub mod policy;
 pub mod receipt;
+pub mod seal;
 pub mod webhook;
 
 pub use action::{Action, Binding};

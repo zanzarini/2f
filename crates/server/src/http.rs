@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::limit::Limiter;
 use crate::service::{Proof, Registration, Service};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -39,6 +39,8 @@ pub fn now() -> u64 {
 struct Guard {
     limiter: Limiter,
     trust_proxy: bool,
+    /// The public address is HTTPS, so browsers are told to insist on it.
+    https: bool,
 }
 
 fn client_address(request: &Request, trust_proxy: bool) -> Option<IpAddr> {
@@ -74,6 +76,7 @@ pub fn router(service: Shared) -> Router {
     let guard = Arc::new(Guard {
         limiter: Limiter::new(service.config.rate_per_minute),
         trust_proxy: service.config.trust_proxy,
+        https: service.config.public_url.starts_with("https://"),
     });
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -98,8 +101,8 @@ pub fn router(service: Shared) -> Router {
             get(|| async { asset("text/css; charset=utf-8", PAGE_CSS) }),
         )
         .layer(DefaultBodyLimit::max(MAX_BODY))
-        .layer(middleware::from_fn_with_state(guard, rate_limit))
-        .layer(middleware::map_response(security_headers))
+        .layer(middleware::from_fn_with_state(guard.clone(), rate_limit))
+        .layer(middleware::from_fn_with_state(guard, security_headers))
         .with_state(service)
 }
 
@@ -115,22 +118,39 @@ pub async fn serve(service: Shared, listen: SocketAddr) -> std::io::Result<()> {
         .await
 }
 
-async fn security_headers(mut response: Response) -> Response {
+async fn security_headers(
+    State(guard): State<Arc<Guard>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
+    let mut set = |name, value: &'static str| {
+        headers.insert(name, HeaderValue::from_static(value));
+    };
+    set(header::CACHE_CONTROL, "no-store");
+    set(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    set(header::X_FRAME_OPTIONS, "DENY");
+    set(header::REFERRER_POLICY, "no-referrer");
+    set(header::CONTENT_SECURITY_POLICY, CSP);
+    set(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        "same-origin",
     );
-    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+    set(
+        HeaderName::from_static("cross-origin-opener-policy"),
+        "same-origin",
     );
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CSP),
+    set(
+        HeaderName::from_static("permissions-policy"),
+        "camera=(), microphone=(), geolocation=(), payment=()",
     );
+    if guard.https {
+        set(
+            header::STRICT_TRANSPORT_SECURITY,
+            "max-age=31536000; includeSubDomains",
+        );
+    }
     response
 }
 
@@ -284,16 +304,31 @@ async fn get_challenge(
     let project = authenticate(&service, &headers).await?;
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(query.wait.unwrap_or(0).min(MAX_WAIT_SECS));
+    let changed = service.changed();
     loop {
+        // Register interest before reading, so a change that lands between
+        // the read and the wait is not missed.
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
         let (project, id) = (project.clone(), id.clone());
         let view = blocking(service.clone(), move |s| {
             s.get_challenge(&project, &id, now())
         })
         .await?;
-        if view.state != "pending" || tokio::time::Instant::now() >= deadline {
+        let now_instant = tokio::time::Instant::now();
+        if view.state != "pending" || now_instant >= deadline {
             return Ok(Json(json!(view)));
         }
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Wake on the next committed change, at the deadline, or when the
+        // challenge itself is due to expire, whichever comes first.
+        let until_expiry = Duration::from_secs(view.expires_at.saturating_sub(now()) + 1);
+        let wake = deadline.min(now_instant + until_expiry);
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep_until(wake) => {}
+        }
     }
 }
 

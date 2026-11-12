@@ -626,8 +626,19 @@ fn a_leaked_database_cannot_issue_receipts_or_call_the_api() {
     );
 
     let attacker = Service::open(&path, ServerKey::generate(), Config::default()).unwrap();
-    let forged = attacker
+    // With their own key the sealed policy and API key are not recognised.
+    assert!(matches!(
+        attacker.authenticate(&api_key),
+        Err(Error::Unauthorized)
+    ));
+    let refused = attacker
         .create_challenge(&project, action.clone(), "k2", T0)
+        .unwrap();
+    assert_eq!(refused.state, "denied");
+    // Even after sealing a policy of their own, what they sign is not ours.
+    attacker.set_policy(&project, POLICY, T0).unwrap();
+    let forged = attacker
+        .create_challenge(&project, action.clone(), "k3", T0)
         .unwrap()
         .receipt
         .unwrap();

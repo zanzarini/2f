@@ -147,6 +147,8 @@ enum ApproverCmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Disable an approver for good and revoke every credential they hold.
+    Disable { project: String, id: String },
 }
 
 #[derive(Subcommand)]
@@ -370,6 +372,10 @@ fn run(cli: Cli) -> AnyResult<()> {
             let name = name.as_deref().unwrap_or(id);
             open(&cli, Config::default())?.add_approver(project, id, name, now())?;
             println!("approver {id} added");
+        }
+        Command::Approver(ApproverCmd::Disable { project, id }) => {
+            open(&cli, Config::default())?.disable_approver(project, id, now())?;
+            println!("approver {id} disabled and their credentials revoked");
         }
         Command::Credential(CredentialCmd::Add {
             project,

@@ -8,6 +8,7 @@ pub mod error;
 pub mod http;
 pub mod limit;
 pub mod service;
+mod store;
 
 pub use error::{Error, Result};
 pub use service::{Config, Proof, Registration, Service};

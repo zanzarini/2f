@@ -21,6 +21,11 @@ h1 { font-size: 20px; margin: 18px 0 14px; }
 .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); }
 .value { font-size: 17px; overflow-wrap: anywhere; }
 .value.big { font-size: 30px; font-weight: 700; }
+.notes { margin: 0 -16px; padding: 8px 16px; background: var(--bg); color: var(--muted); font-size: 12px;
+         border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.row.note { padding: 9px 0 9px 12px; }
+.row.note .label { text-transform: none; letter-spacing: 0; }
+.row.note .value { font-size: 14px; color: var(--muted); }
 .value.mono { font-family: ui-monospace, Consolas, monospace; font-size: 15px; }
 #status { min-height: 24px; margin: 16px 0 8px; color: var(--muted); }
 #status.ok { color: var(--ok); font-weight: 600; }

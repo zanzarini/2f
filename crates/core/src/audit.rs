@@ -13,6 +13,18 @@ use serde_json::{json, Value};
 
 pub const AUDIT_TAG: &str = "2F-AUDIT-v1";
 pub const CHECKPOINT_TAG: &str = "2F-CHECKPOINT-v1";
+pub const ENTRY_SIG_TAG: &str = "2F-AUDIT-SIG-v1";
+
+/// Signs an entry hash. The chain alone is tamper evident but anyone can
+/// extend it; signed entries can only be appended by the key holder.
+pub fn sign_entry(key: &ServerKey, hash: &str) -> String {
+    b64(&key.sign(format!("{ENTRY_SIG_TAG}\n{hash}").as_bytes()))
+}
+
+pub fn entry_signature_valid(key: &VerifyingKey, hash: &str, sig: &str) -> bool {
+    unb64(sig)
+        .is_some_and(|sig| keys::verify(key, format!("{ENTRY_SIG_TAG}\n{hash}").as_bytes(), &sig))
+}
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

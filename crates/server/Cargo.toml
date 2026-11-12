@@ -20,7 +20,7 @@ ed25519-dalek.workspace = true
 axum = "0.8"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"

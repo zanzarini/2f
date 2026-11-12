@@ -131,6 +131,11 @@ def verify_receipt(token: str, public_keys: Dict[str, str], action: Dict[str, An
         raise TwoFError("unknown_key", "receipt was signed by an unknown key")
     if not _ed25519_verify(key, b"2F-RECEIPT-v1\n" + payload_bytes, signature):
         raise TwoFError("bad_signature", "receipt signature is invalid")
+    for field in ("expires_at", "issued_at"):
+        if type(payload.get(field)) is not int:
+            raise TwoFError("malformed", "receipt is malformed")
+    if not isinstance(payload.get("action_hash"), str):
+        raise TwoFError("malformed", "receipt is malformed")
     if now > payload["expires_at"]:
         raise TwoFError("expired", "receipt has expired")
     if payload["issued_at"] > now + CLOCK_SKEW:

@@ -9,7 +9,7 @@ PORT="${TWOF_DEMO_PORT:-8722}"
 export TWOF_PUBLIC_URL="http://localhost:$PORT"
 WORK="$(mktemp -d)"
 export TWOF_DB="$WORK/twof.db" TWOF_KEY_FILE="$WORK/twof.key"
-trap 'kill "$SERVER_PID" 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
 "$BIN" init >/dev/null
 PROJECT="$("$BIN" project create "Demo Exchange")"

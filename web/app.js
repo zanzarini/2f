@@ -18,6 +18,7 @@
       cancelled: "Nothing was signed.", unsupported: "This browser does not support passkeys.",
       failed: "Something went wrong. Try again.",
       approveHint: "Check the amount and the destination. Your device signs exactly what is shown here.",
+      extra: "Notes sent by the requesting system",
       enrollHint: "Your device will ask for your fingerprint, face or PIN. The key never leaves it.",
       approver: "Approver",
     },
@@ -35,6 +36,7 @@
       cancelled: "Nada foi assinado.", unsupported: "Este navegador não suporta passkeys.",
       failed: "Algo deu errado. Tente de novo.",
       approveHint: "Confira o valor e o destino. Seu dispositivo assina exatamente o que aparece aqui.",
+      extra: "Observações enviadas pelo sistema solicitante",
       enrollHint: "Seu dispositivo vai pedir digital, rosto ou PIN. A chave nunca sai dele.",
       approver: "Aprovador",
     },
@@ -57,9 +59,9 @@
     $("status").textContent = message;
     $("status").className = kind || "";
   };
-  const row = (label, value, style) => {
+  const row = (label, value, style, note) => {
     const wrap = document.createElement("div");
-    wrap.className = "row";
+    wrap.className = note ? "row note" : "row";
     const l = document.createElement("div");
     l.className = "label";
     l.textContent = label;
@@ -109,7 +111,16 @@
       row(t.amount, action.asset, "big");
     }
     if (action.destination !== undefined) row(t.destination, action.destination, "mono");
-    for (const [key, value] of Object.entries(action.meta || {})) row(key, display(value));
+    // Free form notes are kept visibly apart from the fields above, so a
+    // note named "Destination" cannot pass for the real destination.
+    const notes = Object.entries(action.meta || {});
+    if (notes.length) {
+      const heading = document.createElement("div");
+      heading.className = "notes";
+      heading.textContent = t.extra;
+      $("details").append(heading);
+      for (const [key, value] of notes) row(key, display(value), "", true);
+    }
     if (data.state !== "pending") return finish(t.state[data.state] || data.state, "error");
 
     const countdown = row(t.expires, "");

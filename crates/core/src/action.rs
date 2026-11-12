@@ -68,6 +68,9 @@ impl Action {
         if self.amount.is_some() {
             self.amount_decimal()?;
         }
+        if let Some(meta) = &self.meta {
+            check_meta_map(meta)?;
+        }
         if self.canonical()?.len() > MAX_CANONICAL {
             return invalid("action is too large");
         }
@@ -111,15 +114,50 @@ impl Action {
     }
 }
 
+/// Characters that are invisible or reorder the text around them. In a
+/// destination they would let the screen show something other than what is
+/// signed (for example a right-to-left override reversing an address).
+fn deceptive(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+}
+
+fn bad_key(key: &str) -> bool {
+    key.is_empty() || key.chars().any(|c| c.is_control() || deceptive(c))
+}
+
 fn check_text(field: &str, value: &str, max: usize) -> Result<(), ActionError> {
     if value.is_empty() || value.len() > max {
         return invalid(format!("{field} must have between 1 and {max} bytes"));
     }
-    if value.chars().any(char::is_control) {
-        return invalid(format!("{field} contains control characters"));
+    if value.chars().any(|c| c.is_control() || deceptive(c)) {
+        return invalid(format!("{field} contains control or invisible characters"));
     }
     if value.trim() != value {
         return invalid(format!("{field} has leading or trailing whitespace"));
+    }
+    Ok(())
+}
+
+/// Meta is free form, but it is shown to approvers too.
+fn check_meta(value: &Value) -> Result<(), ActionError> {
+    match value {
+        Value::String(s) if s.chars().any(deceptive) => {
+            invalid("meta contains invisible or text reordering characters")
+        }
+        Value::Array(items) => items.iter().try_for_each(check_meta),
+        Value::Object(map) => check_meta_map(map),
+        _ => Ok(()),
+    }
+}
+
+fn check_meta_map(map: &Map<String, Value>) -> Result<(), ActionError> {
+    for (key, item) in map {
+        if bad_key(key) {
+            return invalid("meta keys cannot be empty or contain control or invisible characters");
+        }
+        check_meta(item)?;
     }
     Ok(())
 }
@@ -216,6 +254,12 @@ mod tests {
             r#"{"type":"x","destination":"0x\u0000abc"}"#,
             r#"{"type":"x","meta":{"rate":0.5}}"#,
             r#"{"type":"x","type":"y"}"#,
+            // Right-to-left override: the screen would show the address reversed.
+            "{\"type\":\"x\",\"destination\":\"0xabc\u{202e}def\"}",
+            "{\"type\":\"x\",\"asset\":\"US\u{200b}DT\"}",
+            "{\"type\":\"x\",\"meta\":{\"note\":\"a\u{202e}b\"}}",
+            "{\"type\":\"x\",\"meta\":{\"deep\":[{\"k\u{2066}\":1}]}}",
+            r#"{"type":"x","meta":{"":1}}"#,
         ] {
             assert!(Action::parse(bad).is_err(), "should reject {bad}");
         }

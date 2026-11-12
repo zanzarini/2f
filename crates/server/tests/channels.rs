@@ -111,7 +111,9 @@ fn pending_challenges_queue_a_signed_webhook_and_a_telegram_message() {
 
     let telegram = &items[0];
     assert_eq!(telegram.target, "-100123");
-    assert!(telegram.body.contains("withdraw 100 USDT") && telegram.body.contains("0xaaa"));
+    assert!(
+        telegram.body.contains("Amount: 100 USDT") && telegram.body.contains("Destination: 0xaaa")
+    );
     assert!(telegram.body.contains(&format!("/approve/{}", ch.id)));
 
     let hook = &items[1];
