@@ -163,6 +163,7 @@ pub struct Decision {
 impl Policy {
     pub fn parse(json: &str) -> Result<Self, PolicyError> {
         let value = crate::canonical::parse_strict(json).map_err(|e| PolicyError(e.to_string()))?;
+        check_outcome_shape(&value)?;
         let policy: Policy =
             serde_json::from_value(value).map_err(|e| PolicyError(e.to_string()))?;
         policy.validate()?;
@@ -232,13 +233,25 @@ impl Policy {
                     ));
                 }
             }
+            // "Up to 100" with no asset named would let 100 of anything
+            // through: 100 USDT and 100 BTC alike.
+            let looks_at_amount =
+                when.amount_min.is_some() || when.amount_max.is_some() || when.velocity.is_some();
+            if rule.then == Outcome::Allow && looks_at_amount && when.asset.is_none() {
+                return Err(ctx(
+                    "an allow rule that looks at amounts must also name the asset",
+                ));
+            }
             if let Outcome::Require { requirements } = &rule.then {
                 if requirements.is_empty() {
                     return Err(ctx("require needs at least one requirement"));
                 }
+                if requirements.len() > MAX_REQUIREMENTS {
+                    return Err(ctx("too many requirements in one rule"));
+                }
                 for req in requirements {
-                    if req.count == 0 {
-                        return Err(ctx("requirement count must be at least 1"));
+                    if req.count == 0 || req.count > MAX_COUNT {
+                        return Err(ctx("requirement count must be between 1 and 16"));
                     }
                     if req.kinds.as_ref().is_some_and(Vec::is_empty)
                         || req.approvers.as_ref().is_some_and(Vec::is_empty)
@@ -371,8 +384,98 @@ impl Requirement {
 
 /// True when every requirement is satisfied. An empty list is never
 /// satisfied: "require nothing" is not a way to spell allow.
+///
+/// One person fills one place. If a rule asks for "a person" and "the vault",
+/// someone who happens to hold both kinds of credential does not satisfy it
+/// alone: every requirement must be covered by different approvers.
 pub fn all_satisfied(requirements: &[Requirement], approvals: &[ApprovalFact]) -> bool {
-    !requirements.is_empty() && requirements.iter().all(|r| r.satisfied(approvals))
+    if requirements.is_empty() {
+        return false;
+    }
+    let people: Vec<&str> = approvals
+        .iter()
+        .map(|f| f.approver.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    // One slot per person a requirement asks for, each naming its requirement.
+    let mut slots: Vec<usize> = Vec::new();
+    for (index, requirement) in requirements.iter().enumerate() {
+        let wanted = requirement.count as usize;
+        if wanted == 0 || slots.len() + wanted > people.len() {
+            return false;
+        }
+        slots.extend(std::iter::repeat_n(index, wanted));
+    }
+    let fits: Vec<Vec<bool>> = requirements
+        .iter()
+        .map(|requirement| {
+            people
+                .iter()
+                .map(|person| {
+                    approvals
+                        .iter()
+                        .any(|f| f.approver == *person && requirement.accepts(f))
+                })
+                .collect()
+        })
+        .collect();
+
+    // Bipartite matching (augmenting paths): seat every slot with a
+    // different person who fits its requirement.
+    fn seat(
+        slot: usize,
+        slots: &[usize],
+        fits: &[Vec<bool>],
+        holder: &mut [Option<usize>],
+        tried: &mut [bool],
+    ) -> bool {
+        for person in 0..holder.len() {
+            if !fits[slots[slot]][person] || tried[person] {
+                continue;
+            }
+            tried[person] = true;
+            let free = match holder[person] {
+                None => true,
+                Some(other) => seat(other, slots, fits, holder, tried),
+            };
+            if free {
+                holder[person] = Some(slot);
+                return true;
+            }
+        }
+        false
+    }
+    let mut holder: Vec<Option<usize>> = vec![None; people.len()];
+    (0..slots.len()).all(|slot| {
+        let mut tried = vec![false; people.len()];
+        seat(slot, &slots, &fits, &mut holder, &mut tried)
+    })
+}
+
+/// Largest number of approvers one requirement may ask for.
+pub const MAX_COUNT: u32 = 16;
+/// Largest number of requirements in one rule.
+pub const MAX_REQUIREMENTS: usize = 8;
+
+/// A `then` block must contain exactly what its decision uses. Without this,
+/// `{"decision":"allow","requirements":[...]}` (someone meant "require")
+/// would quietly allow.
+fn check_outcome_shape(policy: &serde_json::Value) -> Result<(), PolicyError> {
+    let rules = policy.get("rules").and_then(|r| r.as_array());
+    for rule in rules.into_iter().flatten() {
+        let Some(then) = rule.get("then").and_then(|t| t.as_object()) else {
+            continue;
+        };
+        let allowed: &[&str] = match then.get("decision").and_then(|d| d.as_str()) {
+            Some("require") => &["decision", "requirements"],
+            _ => &["decision"],
+        };
+        if let Some(extra) = then.keys().find(|key| !allowed.contains(&key.as_str())) {
+            return bad(format!("\"{extra}\" does not belong in this outcome"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -599,6 +702,105 @@ mod tests {
         assert!(!default.satisfied(&[fact("alice", ApproverKind::Totp)]));
         let weak_ok = req(r#"{"count":1,"min_strength":"weak"}"#);
         assert!(weak_ok.satisfied(&[fact("alice", ApproverKind::Telegram)]));
+    }
+
+    #[test]
+    fn one_person_fills_one_place() {
+        let person_and_vault = [
+            req(r#"{"count":1,"kinds":["ed25519"]}"#),
+            req(r#"{"count":1,"kinds":["cosigner"]}"#),
+        ];
+        // Alice was (wrongly) also given the vault's kind of credential.
+        let alice_both = [
+            fact("alice", ApproverKind::Ed25519),
+            fact("alice", ApproverKind::Cosigner),
+        ];
+        assert!(!all_satisfied(&person_and_vault, &alice_both));
+        let both = [
+            fact("alice", ApproverKind::Ed25519),
+            fact("vault", ApproverKind::Cosigner),
+        ];
+        assert!(all_satisfied(&person_and_vault, &both));
+
+        // "Any one" plus "one of alice or bob": two different people needed.
+        let overlap = [
+            req(r#"{"count":1}"#),
+            req(r#"{"count":1,"approvers":["alice","bob"]}"#),
+        ];
+        assert!(!all_satisfied(
+            &overlap,
+            &[fact("alice", ApproverKind::Passkey)]
+        ));
+        assert!(all_satisfied(
+            &overlap,
+            &[
+                fact("alice", ApproverKind::Passkey),
+                fact("carol", ApproverKind::Passkey)
+            ]
+        ));
+        // The order people approve in must not matter: carol can only fill
+        // the open place, so alice has to be moved to the named one.
+        assert!(all_satisfied(
+            &overlap,
+            &[
+                fact("carol", ApproverKind::Passkey),
+                fact("alice", ApproverKind::Passkey)
+            ]
+        ));
+        assert!(!all_satisfied(
+            &overlap,
+            &[
+                fact("carol", ApproverKind::Passkey),
+                fact("dave", ApproverKind::Passkey)
+            ]
+        ));
+        // Asking for more people than exist never passes, however large.
+        let many = [req(r#"{"count":3}"#), req(r#"{"count":2}"#)];
+        let four: Vec<ApprovalFact> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| fact(n, ApproverKind::Passkey))
+            .collect();
+        assert!(!all_satisfied(&many, &four));
+        let mut five = four.clone();
+        five.push(fact("e", ApproverKind::Passkey));
+        assert!(all_satisfied(&many, &five));
+    }
+
+    #[test]
+    fn dangerous_policy_shapes_are_rejected() {
+        let wrap = |rule: &str| format!(r#"{{"version":1,"rules":[{rule}]}}"#);
+        for bad in [
+            // Meant "require", typed "allow": must not quietly allow.
+            wrap(
+                r#"{"name":"a","when":{},"then":{"decision":"allow","requirements":[{"count":1}]}}"#,
+            ),
+            wrap(
+                r#"{"name":"a","when":{},"then":{"decision":"deny","requirements":[{"count":1}]}}"#,
+            ),
+            wrap(r#"{"name":"a","when":{},"then":{"decision":"allow","note":"x"}}"#),
+            // "Up to 100" of any asset.
+            wrap(r#"{"name":"a","when":{"amount_max":"100"},"then":{"decision":"allow"}}"#),
+            wrap(
+                r#"{"name":"a","when":{"velocity":{"window_secs":60,"max_total":"5"}},"then":{"decision":"allow"}}"#,
+            ),
+            wrap(
+                r#"{"name":"a","when":{},"then":{"decision":"require","requirements":[{"count":17}]}}"#,
+            ),
+            wrap(
+                r#"{"name":"a","when":{},"then":{"decision":"require","requirements":[{"count":1},{"count":1},{"count":1},{"count":1},{"count":1},{"count":1},{"count":1},{"count":1},{"count":1}]}}"#,
+            ),
+        ] {
+            assert!(Policy::parse(&bad).is_err(), "should reject {bad}");
+        }
+        // Amount limits on rules that do not allow are fine without an asset.
+        assert!(Policy::parse(&wrap(
+            r#"{"name":"a","when":{"amount_min":"1000"},"then":{"decision":"require","requirements":[{"count":2}]}}"#
+        ))
+        .is_ok());
+        assert!(Policy::parse(&wrap(
+            r#"{"name":"a","when":{"asset":["USDT"],"amount_max":"100"},"then":{"decision":"allow"}}"#
+        ))
+        .is_ok());
     }
 
     #[test]

@@ -112,7 +112,7 @@ Exemplo completo em [examples/policy.json](examples/policy.json).
 | Tipo | O que é |
 |---|---|
 | `passkey` | digital, rosto ou PIN no celular ou computador, pela página embutida |
-| `ed25519` | chave de dispositivo para aprovar por linha de comando ou aplicativo |
+| `ed25519` | chave de dispositivo para aprovar por linha de comando ou aplicativo. `twof device approve` mostra a ação e assina o hash que ele mesmo calcula |
 | `cosigner` | uma segunda máquina, com chave e regras próprias (`twof cosign`) |
 | Telegram | mensagem com o link de aprovação. Avisa, nunca aprova |
 | Webhooks | eventos assinados com a chave do servidor |
@@ -123,10 +123,10 @@ Exemplo completo em [examples/policy.json](examples/policy.json).
 |---|---|
 | **Amarrado à ação** | Comprovantes e aprovações cobrem o SHA-256 de uma forma canônica. Mudou um dígito do valor, nada mais confere. |
 | **Nada para roubar no banco** | Só chaves públicas e hashes. A chave de assinatura fica fora dele. |
-| **Nada para plantar no banco** | Credenciais, chaves de API e regras levam um selo da chave do servidor. Linha escrita por outra pessoa é ignorada; regra adulterada nega tudo. |
+| **Nada para plantar no banco** | Credenciais, chaves de API, regras, links de cadastro e cada pedido levam um selo da chave do servidor. Linha escrita por outra pessoa é ignorada; regra adulterada nega tudo; aprovação plantada não conta. |
 | **Auditoria assinada** | Encadeada e assinada entrada por entrada. `twof audit verify` aponta edições, exclusões e permissões que o registro não explica. |
-| **Não confia em si mesmo** | O cliente pode fixar as chaves dos aprovadores e conferir as assinaturas dentro do comprovante, então nem um servidor 2F invadido inventa uma aprovação. |
-| **Rápido** | Gravação em lote e leituras em paralelo: cerca de 4.400 autorizações duráveis por segundo e 450.000 leituras por segundo na [medição](docs/ARCHITECTURE.md#7-why-it-is-fast), em um notebook. |
+| **Não confia em si mesmo** | O cliente pode fixar as chaves de dispositivo e de co-assinador e conferir as assinaturas dentro do comprovante, e a página e o aprovador de terminal recalculam o que assinam, então nem um servidor 2F invadido inventa uma dessas aprovações. |
+| **Rápido** | Gravação em lote e leituras em paralelo: cerca de 3.000 autorizações duráveis por segundo e 450.000 leituras por segundo na [medição](docs/ARCHITECTURE.md#7-why-it-is-fast), em um notebook. |
 
 ## Publicando
 

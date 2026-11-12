@@ -26,6 +26,7 @@ h1 { font-size: 20px; margin: 18px 0 14px; }
 .row.note { padding: 9px 0 9px 12px; }
 .row.note .label { text-transform: none; letter-spacing: 0; }
 .row.note .value { font-size: 14px; color: var(--muted); }
+.warning { margin-top: 6px; font-size: 13px; font-weight: 600; color: var(--danger); }
 .value.mono { font-family: ui-monospace, Consolas, monospace; font-size: 15px; }
 #status { min-height: 24px; margin: 16px 0 8px; color: var(--muted); }
 #status.ok { color: var(--ok); font-weight: 600; }

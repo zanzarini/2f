@@ -22,14 +22,15 @@ of the table has tests behind it; the file is named in the last column.
 |---|---|---|---|
 | Stolen client API key | Create challenges and read their status | Cannot approve. Anything outside the auto-allow rules still needs an approver signature. Damage is bounded by the policy limits and velocity caps. | `flow.rs` |
 | Database copy leaked (read) | Read public keys, API key hashes, history | Cannot approve (no private keys), cannot call the API (hashes only), cannot issue receipts (the signing key is not there). | `flow.rs` |
-| Database write access | Insert, edit or delete rows | Cannot grant themselves power: credentials, API keys and policies are sealed with the server key and ignored without a valid seal. An edited policy fails closed to "deny everything". Cannot extend the audit log: every entry is signed. Edits, deletions and extra grants are reported by `twof audit verify`. | `tamper.rs` |
+| Database write access | Insert, edit or delete rows | Cannot grant themselves power. Credentials, API keys, policies, enrollment links, notification settings and every challenge (its state, requirements and deadline) are sealed with the server key; a row without a valid seal is ignored or refused, and an edited policy fails closed to "deny everything". A planted approval does not count: each stored signature is verified again when the quorum is counted. The approver is never shown an action other than the one whose hash is signed. A decided challenge or a used receipt cannot be put back while the server runs. Notifications planted or redirected in the queue are not sent. The audit log cannot be extended (every entry is signed), and `twof audit verify` reports rows that no longer match it: grants, policies, challenge states, used receipts. | `tamper.rs`, `channels.rs` |
 | Network attacker or tampering client | Replay or alter requests | Receipts bind the hash of the canonical action; changing amount or destination invalidates them. Receipts expire in minutes and are consumed once. Approvals are bound to one challenge. | `flow.rs`, core |
 | Phishing an approver | Show a fake page | Passkeys are bound to the real origin, so a look-alike site cannot obtain a usable signature. The signature covers the action hash, so approving A cannot be reused for B. | `passkey.rs` |
 | Misleading the approver's screen | Send text that displays as something else | Invisible and text reordering characters are rejected in every field shown. Free form notes are displayed apart from amount and destination. | core `action` |
-| Stolen approver device, or a rogue approver | Approve as that person | Rules can require several distinct people or an independent co-signer. Disabling an approver revokes their credentials and their approvals on pending challenges stop counting. | `tamper.rs` |
+| Stolen approver device, or a rogue approver | Approve as that person | Rules can require several distinct people or an independent co-signer. One person fills one place: someone holding two kinds of credential does not satisfy "a person and the vault" alone. Disabling an approver revokes their credentials and their approvals on pending challenges stop counting. | `tamper.rs`, core `policy` |
+| A policy written carelessly | Rely on a rule that allows more than intended | Policies are refused when they contain an unknown field, an outcome with parts that do not belong to it (`allow` with `requirements`), or an `allow` rule that limits amounts without naming the asset. | core `policy` |
 | Cloned passkey | Use a copy of an authenticator | A signature counter that fails to grow is refused. | `passkey.rs` |
 | Weak channel compromised (Telegram account) | Read notifications | Telegram only carries the link. It never approves. | `channels.rs` |
-| Compromised 2F server (code execution and signing key) | Issue receipts | This defeats the receipt on its own. Clients that pin approver public keys verify the approver signatures inside the receipt themselves, and an independent co-signer on another machine refuses to sign anything its own policy rejects, including a binding that does not match the action shown to it. | `channels.rs`, SDK tests |
+| Compromised 2F server (code execution and signing key) | Issue receipts | This defeats the receipt on its own. Three things still stand. Clients that pin approver public keys verify the device key and co-signer signatures inside the receipt themselves. An independent co-signer on another machine refuses anything its own policy rejects, including a binding that does not match the action shown to it, and keeps its own running total, so many small requests do not get past its velocity limit. The terminal approver (`twof device approve`) and the approval page recompute the hash from the action they display and refuse a mismatch. | `channels.rs`, `device.rs`, SDK tests |
 
 ## Design rules that follow
 
@@ -59,12 +60,23 @@ Stated plainly so nobody relies on something that is not there.
 - **Cutting the end off the audit log** is only detected against a checkpoint
   kept somewhere the server cannot write. Run `twof audit checkpoint` on a
   schedule and store the output elsewhere.
-- **Replaying an old seal.** An attacker with write access who saved a
-  credential's seal before it was revoked can restore the row. `twof audit
-  verify` reports it; the server alone does not, because it would need to
-  replay the log on every approval.
+- **Putting back an old version of a row.** A seal proves this server wrote
+  a row, not that it is the newest version. Someone with write access who
+  saved a credential before it was revoked, or a policy before it was
+  tightened, can restore it with its genuine seal. For challenges and receipts
+  the running server remembers what it has seen decided or used and refuses
+  the old version; for credentials and policies, which are changed from the
+  command line, only `twof audit verify` reports it. Run it on a schedule.
 - **History based limits.** Velocity caps are computed from stored
   challenges. Deleting rows resets them; the audit check shows the deletion.
+- **Pinned approvers cover keys, not passkeys.** The SDKs verify device key
+  and co-signer signatures inside a receipt. Passkey proofs are carried in the
+  receipt but the SDKs do not verify them yet.
+- **Enrollment links.** Whoever opens a registration link first registers
+  their device. Links are single use, last 15 minutes and are logged; hand
+  them over through a channel you trust.
+- **The co-signer's memory.** Its running total lives in memory and starts
+  from zero when its process restarts.
 - **Key rotation** is not implemented. Seals and audit signatures are tied to
   the one server key.
 - **The approver's own device.** Malware that changes what the screen shows

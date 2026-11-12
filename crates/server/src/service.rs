@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -46,14 +46,14 @@ CREATE TABLE IF NOT EXISTS credentials (
     FOREIGN KEY (project, approver) REFERENCES approvers(project, id));
 CREATE TABLE IF NOT EXISTS enrollments (
     token_hash TEXT PRIMARY KEY, project TEXT NOT NULL, approver TEXT NOT NULL,
-    challenge TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER,
+    challenge TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER, seal TEXT,
     FOREIGN KEY (project, approver) REFERENCES approvers(project, id));
 CREATE TABLE IF NOT EXISTS challenges (
     id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(id),
     idempotency_key TEXT NOT NULL, action TEXT NOT NULL, action_hash TEXT NOT NULL,
     amount TEXT, asset TEXT, state TEXT NOT NULL, rule TEXT, requirements TEXT,
     expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER, receipt TEXT,
-    UNIQUE (project, idempotency_key));
+    seal TEXT, UNIQUE (project, idempotency_key));
 CREATE INDEX IF NOT EXISTS challenges_velocity ON challenges (project, asset, decided_at);
 CREATE TABLE IF NOT EXISTS approvals (
     challenge TEXT NOT NULL REFERENCES challenges(id), approver TEXT NOT NULL,
@@ -69,11 +69,11 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     seq INTEGER NOT NULL, hash TEXT NOT NULL, ts INTEGER NOT NULL, kid TEXT NOT NULL,
     sig TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS channels (
-    project TEXT PRIMARY KEY REFERENCES projects(id), webhook_url TEXT, telegram_chat TEXT);
+    project TEXT PRIMARY KEY REFERENCES projects(id), webhook_url TEXT, telegram_chat TEXT, seal TEXT);
 CREATE TABLE IF NOT EXISTS outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, kind TEXT NOT NULL,
     target TEXT NOT NULL, body TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-    next_at INTEGER NOT NULL, done_at INTEGER, failed INTEGER NOT NULL DEFAULT 0);
+    next_at INTEGER NOT NULL, done_at INTEGER, failed INTEGER NOT NULL DEFAULT 0, seal TEXT);
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox (next_at) WHERE done_at IS NULL;
 ";
 
@@ -161,6 +161,8 @@ pub struct OutboxItem {
     pub kind: String,
     pub target: String,
     pub body: String,
+    /// The server's seal over kind, target and body, set when it was queued.
+    pub seal: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -220,6 +222,7 @@ struct ChallengeRow {
     requirements: Option<String>,
     expires_at: u64,
     receipt: Option<String>,
+    seal: Option<String>,
 }
 
 impl ChallengeRow {
@@ -347,38 +350,186 @@ struct Inner {
     config: Config,
     /// Seals already verified, so hot paths do not repeat the signature check.
     verified: Mutex<HashSet<[u8; 32]>>,
+    /// Challenges this process has seen decided and receipts it has seen
+    /// used, with the time after which each stops mattering. A seal proves a
+    /// row was written by this server, not that it is the latest version:
+    /// someone who saved a "pending" row could put it back after a refusal.
+    /// This memory, which is not in the database, refuses that.
+    closed: Mutex<HashMap<String, u64>>,
 }
 
 impl Inner {
     fn seal(&self, fields: &Value) -> String {
-        seal::sign(&self.key, fields)
+        let seal = seal::sign(&self.key, fields);
+        // We just made it, so there is no need to verify it later.
+        self.remember(seal_digest(fields, &seal));
+        seal
     }
 
-    /// True when `seal` is this server's seal over `fields`.
-    fn sealed(&self, fields: &Value, seal: Option<&str>) -> bool {
-        let Some(seal) = seal else { return false };
-        let mut hasher = Sha256::new();
-        hasher.update(seal::message(fields));
-        hasher.update([0]);
-        hasher.update(seal.as_bytes());
-        let digest: [u8; 32] = hasher.finalize().into();
-        if self
-            .verified
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(&digest)
-        {
-            return true;
-        }
-        if !seal::verify(&self.public, fields, seal) {
-            return false;
-        }
+    fn remember(&self, digest: [u8; 32]) {
         let mut cache = self.verified.lock().unwrap_or_else(|p| p.into_inner());
         if cache.len() >= SEAL_CACHE_MAX {
             cache.clear();
         }
         cache.insert(digest);
+    }
+
+    /// Remembers that a challenge was decided or a receipt used.
+    fn close(&self, id: &str, until: u64, now: u64) {
+        let mut closed = self.closed.lock().unwrap_or_else(|p| p.into_inner());
+        if closed.len() >= 4096 {
+            closed.retain(|_, until| *until >= now);
+        }
+        closed.insert(id.to_owned(), until);
+    }
+
+    fn is_closed(&self, id: &str) -> bool {
+        self.closed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id)
+    }
+
+    fn remembered(&self, digest: &[u8; 32]) -> bool {
+        self.verified
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(digest)
+    }
+
+    /// True when `seal` is this server's seal over `fields`.
+    fn sealed(&self, fields: &Value, seal: Option<&str>) -> bool {
+        let Some(seal) = seal else { return false };
+        let digest = seal_digest(fields, seal);
+        if self.remembered(&digest) {
+            return true;
+        }
+        if !seal::verify(&self.public, fields, seal) {
+            return false;
+        }
+        self.remember(digest);
         true
+    }
+
+    /// Checks a stored proof against a credential's public key. Returns the
+    /// passkey signature counter (zero for plain keys).
+    fn proof_valid(
+        &self,
+        kind: ApproverKind,
+        public_key: &str,
+        message: &[u8; 32],
+        proof: &str,
+    ) -> Option<u32> {
+        match kind {
+            ApproverKind::Ed25519 | ApproverKind::Cosigner => {
+                let bytes = B64.decode(proof).ok()?;
+                let key = keys::public_from_hex(public_key).ok()?;
+                keys::verify(&key, message, &bytes).then_some(0)
+            }
+            ApproverKind::Passkey => {
+                let rp = self.config.relying_party().ok()?;
+                let spki = hex::decode(public_key).ok()?;
+                let assertion = AssertionProof::decode(proof)?;
+                passkey::verify_proof(&rp, &spki, message, &assertion).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Refuses a challenge row that is not exactly as this server left it:
+    /// the seal covers its state and requirements, and the action shown to
+    /// approvers must be the one whose hash they sign.
+    fn intact(&self, row: &ChallengeRow) -> Result<()> {
+        let tampered = || Error::Conflict("challenge record failed its integrity check".into());
+        if !self.sealed(&challenge_fields(row), row.seal.as_deref()) {
+            return Err(tampered());
+        }
+        // Decided once, never pending again.
+        if row.state == "pending" && self.is_closed(&row.id) {
+            return Err(tampered());
+        }
+        let action = Action::parse(&row.action).map_err(|_| tampered())?;
+        if action.hash_hex().map_err(|_| tampered())? != row.action_hash {
+            return Err(tampered());
+        }
+        Ok(())
+    }
+
+    /// Seals the row as it is now. Called after every change of state.
+    fn reseal(&self, conn: &Connection, row: &mut ChallengeRow) -> Result<()> {
+        let seal = self.seal(&challenge_fields(row));
+        exec(
+            conn,
+            "UPDATE challenges SET seal = ? WHERE id = ?",
+            params![seal, row.id],
+        )?;
+        row.seal = Some(seal);
+        Ok(())
+    }
+
+    /// Approvals that count: the credential is sealed, not revoked, its
+    /// approver not disabled, and the stored signature really is that
+    /// credential's signature over this challenge. A row someone inserted
+    /// into the approvals table is not an approval.
+    fn approvals(
+        &self,
+        conn: &Connection,
+        row: &ChallengeRow,
+    ) -> Result<Vec<(ApprovalView, String)>> {
+        let message = row.binding().hash();
+        let mut stmt = conn.prepare_cached(
+            "SELECT c.approver, c.kind, a.sig, c.id, c.public_key, c.external_id, c.seal \
+             FROM approvals a JOIN credentials c ON c.id = a.credential \
+             JOIN approvers p ON p.project = c.project AND p.id = c.approver \
+             WHERE a.challenge = ? AND c.project = ? AND c.revoked_at IS NULL AND p.disabled_at IS NULL \
+             ORDER BY a.created_at, a.credential",
+        )?;
+        let rows = stmt.query_map(params![row.id, row.project], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for found in rows {
+            let (approver, kind_text, proof, credential, public_key, external_id, seal) = found?;
+            let Some(kind) = ApproverKind::parse(&kind_text) else {
+                continue;
+            };
+            let fields = credential_fields(
+                &row.project,
+                &approver,
+                &credential,
+                &kind_text,
+                &public_key,
+                external_id.as_deref(),
+            );
+            if !self.sealed(&fields, seal.as_deref()) {
+                continue;
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(b"proof\0");
+            hasher.update(public_key.as_bytes());
+            hasher.update(message);
+            hasher.update(proof.as_bytes());
+            let digest: [u8; 32] = hasher.finalize().into();
+            if !self.remembered(&digest) {
+                if self
+                    .proof_valid(kind, &public_key, &message, &proof)
+                    .is_none()
+                {
+                    continue;
+                }
+                self.remember(digest);
+            }
+            out.push((ApprovalView { approver, kind }, proof));
+        }
+        Ok(out)
     }
 
     fn approve_url(&self, challenge: &str) -> String {
@@ -477,9 +628,11 @@ impl Inner {
     }
 
     fn view(&self, conn: &Connection, row: ChallengeRow) -> Result<ChallengeView> {
+        self.intact(&row)?;
         let pending = row.state == "pending";
         Ok(ChallengeView {
-            approvals: approvals_of(conn, &row.id)?
+            approvals: self
+                .approvals(conn, &row)?
                 .into_iter()
                 .map(|a| a.0)
                 .collect(),
@@ -499,6 +652,7 @@ impl Inner {
     }
 
     fn approver_view(&self, conn: &Connection, row: ChallengeRow) -> Result<ApproverView> {
+        self.intact(&row)?;
         let project_name = one(
             conn,
             "SELECT name FROM projects WHERE id = ?",
@@ -517,12 +671,13 @@ impl Inner {
             reject_hash: B64.encode(binding.reject_hash()),
             expires_at: row.expires_at,
             rp_id: self.config.relying_party()?.id,
-            binding,
             requirements: row.requirements()?,
-            approvals: approvals_of(conn, &row.id)?
+            approvals: self
+                .approvals(conn, &row)?
                 .into_iter()
                 .map(|a| a.0)
                 .collect(),
+            binding,
         })
     }
 
@@ -530,19 +685,22 @@ impl Inner {
     fn load(&self, conn: &Connection, id: &str, now: u64) -> Result<ChallengeRow> {
         let mut row = fetch(conn, id)?;
         if row.overdue(now) {
+            self.intact(&row)?;
             exec(
                 conn,
                 "UPDATE challenges SET state = 'expired', decided_at = ? WHERE id = ?",
                 params![now as i64, row.id],
             )?;
+            row.state = "expired".into();
+            self.close(&row.id, row.expires_at, now);
+            self.reseal(conn, &mut row)?;
             self.audit(
                 conn,
                 now,
                 "challenge.expired",
                 json!({ "project": row.project, "challenge": row.id }),
             )?;
-            row.state = "expired".into();
-            emit(
+            self.emit(
                 conn,
                 now,
                 &row.project,
@@ -552,12 +710,105 @@ impl Inner {
         }
         Ok(row)
     }
+
+    /// Queues notifications for an event, inside the caller's transaction.
+    fn emit(
+        &self,
+        conn: &Connection,
+        now: u64,
+        project: &str,
+        event: &str,
+        data: Value,
+    ) -> Result<()> {
+        let channels = one(
+            conn,
+            "SELECT webhook_url, telegram_chat, seal FROM channels WHERE project = ?",
+            [project],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        let Some((webhook, telegram, seal)) = channels else {
+            return Ok(());
+        };
+        // Destinations someone else wrote into the table are not ours:
+        // transaction details are not sent to them.
+        let fields = channel_fields(project, webhook.as_deref(), telegram.as_deref());
+        if !self.sealed(&fields, seal.as_deref()) {
+            eprintln!(
+                "warning: notification settings of project {project} failed their integrity \
+                 check; nothing was sent. Set them again with the CLI."
+            );
+            return Ok(());
+        }
+        let queue = |kind: &str, target: &str, body: &str| {
+            exec(
+                conn,
+                "INSERT INTO outbox (project, kind, target, body, seal, next_at) VALUES (?, ?, ?, ?, ?, ?)",
+                params![project, kind, target, body, self.seal(&outbox_fields(kind, target, body)), now as i64],
+            )
+        };
+        if let (Some(chat), "challenge.pending") = (&telegram, event) {
+            let text = |name: &str| data["action"][name].as_str().unwrap_or("-").to_owned();
+            let message = format!(
+                "2F: approval needed\nOperation: {}\nAmount: {} {}\nDestination: {}\nOpen: {}",
+                text("type"),
+                text("amount"),
+                text("asset"),
+                text("destination"),
+                data["approve_url"].as_str().unwrap_or("")
+            );
+            queue("telegram", chat, &message)?;
+        }
+        if let Some(url) = &webhook {
+            let body = json!({ "event": event, "ts": now, "project": project, "data": data });
+            queue("webhook", url, &canonical::to_canonical(&body)?)?;
+        }
+        Ok(())
+    }
+
+    /// Finds an enrollment this server created that is neither used nor expired.
+    fn open_enrollment(
+        &self,
+        conn: &Connection,
+        token: &str,
+        now: u64,
+    ) -> Result<(String, String, String, u64)> {
+        let hash = token_hash(token);
+        let found = one(
+            conn,
+            "SELECT project, approver, challenge, expires_at, seal FROM enrollments \
+             WHERE token_hash = ? AND used_at IS NULL",
+            [&hash],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? as u64,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )?;
+        let Some((project, approver, challenge, expires_at, seal)) = found else {
+            return Err(Error::NotFound);
+        };
+        let fields = enrollment_fields(&hash, &project, &approver, &challenge, expires_at);
+        if now > expires_at || !self.sealed(&fields, seal.as_deref()) {
+            return Err(Error::NotFound);
+        }
+        Ok((project, approver, challenge, expires_at))
+    }
 }
 
 fn fetch(conn: &Connection, id: &str) -> Result<ChallengeRow> {
     one(
         conn,
-        "SELECT id, project, action, action_hash, state, rule, requirements, expires_at, receipt \
+        "SELECT id, project, action, action_hash, state, rule, requirements, expires_at, receipt, seal \
          FROM challenges WHERE id = ?",
         [id],
         |r| {
@@ -571,104 +822,44 @@ fn fetch(conn: &Connection, id: &str) -> Result<ChallengeRow> {
                 requirements: r.get(6)?,
                 expires_at: r.get::<_, i64>(7)? as u64,
                 receipt: r.get(8)?,
+                seal: r.get(9)?,
             })
         },
     )?
     .ok_or(Error::NotFound)
 }
 
-/// Approvals that still count: given through a credential that has not been
-/// revoked, by an approver that has not been disabled since.
-fn approvals_of(conn: &Connection, challenge: &str) -> Result<Vec<(ApprovalView, String)>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT a.approver, a.kind, a.sig FROM approvals a \
-         JOIN credentials c ON c.id = a.credential \
-         JOIN approvers p ON p.project = c.project AND p.id = c.approver \
-         WHERE a.challenge = ? AND c.revoked_at IS NULL AND p.disabled_at IS NULL \
-         ORDER BY a.created_at, a.credential",
-    )?;
-    let rows = stmt.query_map([challenge], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (approver, kind, sig) = row?;
-        let kind = ApproverKind::parse(&kind).ok_or_else(|| internal("stored approval kind"))?;
-        out.push((ApprovalView { approver, kind }, sig));
-    }
-    Ok(out)
+fn seal_digest(fields: &Value, seal: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(seal::message(fields));
+    hasher.update([0]);
+    hasher.update(seal.as_bytes());
+    hasher.finalize().into()
 }
 
-/// Queues notifications for an event, inside the caller's transaction.
-fn emit(conn: &Connection, now: u64, project: &str, event: &str, data: Value) -> Result<()> {
-    let channels = one(
-        conn,
-        "SELECT webhook_url, telegram_chat FROM channels WHERE project = ?",
-        [project],
-        |r| {
-            Ok((
-                r.get::<_, Option<String>>(0)?,
-                r.get::<_, Option<String>>(1)?,
-            ))
-        },
-    )?;
-    let Some((webhook, telegram)) = channels else {
-        return Ok(());
-    };
-    let queue = |kind: &str, target: &str, body: &str| {
-        exec(
-            conn,
-            "INSERT INTO outbox (project, kind, target, body, next_at) VALUES (?, ?, ?, ?, ?)",
-            params![project, kind, target, body, now as i64],
-        )
-    };
-    if let (Some(chat), "challenge.pending") = (&telegram, event) {
-        let text = |name: &str| data["action"][name].as_str().unwrap_or("-").to_owned();
-        let message = format!(
-            "2F: approval needed\nOperation: {}\nAmount: {} {}\nDestination: {}\nOpen: {}",
-            text("type"),
-            text("amount"),
-            text("asset"),
-            text("destination"),
-            data["approve_url"].as_str().unwrap_or("")
-        );
-        queue("telegram", chat, &message)?;
-    }
-    if let Some(url) = &webhook {
-        let body = json!({ "event": event, "ts": now, "project": project, "data": data });
-        queue("webhook", url, &canonical::to_canonical(&body)?)?;
-    }
-    Ok(())
+fn challenge_fields(row: &ChallengeRow) -> Value {
+    json!({ "t": "challenge", "id": row.id, "project": row.project, "action_hash": row.action_hash,
+            "state": row.state, "requirements": row.requirements, "rule": row.rule,
+            "expires_at": row.expires_at })
 }
 
-/// Finds an enrollment that is neither used nor expired.
-fn open_enrollment(
-    conn: &Connection,
-    token: &str,
-    now: u64,
-) -> Result<(String, String, String, u64)> {
-    let found = one(
-        conn,
-        "SELECT project, approver, challenge, expires_at FROM enrollments \
-         WHERE token_hash = ? AND used_at IS NULL",
-        [token_hash(token)],
-        |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)? as u64,
-            ))
-        },
-    )?;
-    match found {
-        Some(enrollment) if now <= enrollment.3 => Ok(enrollment),
-        _ => Err(Error::NotFound),
-    }
+fn enrollment_fields(
+    hash: &str,
+    project: &str,
+    approver: &str,
+    challenge: &str,
+    expires_at: u64,
+) -> Value {
+    json!({ "t": "enrollment", "token_hash": hash, "project": project, "approver": approver,
+            "challenge": challenge, "expires_at": expires_at })
+}
+
+fn channel_fields(project: &str, webhook: Option<&str>, telegram: Option<&str>) -> Value {
+    json!({ "t": "channels", "project": project, "webhook_url": webhook, "telegram_chat": telegram })
+}
+
+fn outbox_fields(kind: &str, target: &str, body: &str) -> Value {
+    json!({ "t": "outbox", "kind": kind, "target": target, "body": body })
 }
 
 struct VelocityCtx<'a> {
@@ -713,6 +904,108 @@ impl PolicyContext for VelocityCtx<'_> {
 
 type CredentialRecord = (String, String, String, String);
 
+/// What the database says is in force, to compare with what the log says.
+#[derive(Default, PartialEq)]
+struct StoredState {
+    credentials: BTreeMap<String, CredentialRecord>,
+    api_keys: BTreeSet<(String, String)>,
+    challenges: BTreeMap<String, String>,
+    consumed: BTreeSet<String>,
+    policies: BTreeMap<String, Value>,
+}
+
+fn read_audit(conn: &Connection) -> Result<Vec<(Entry, String)>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT seq, ts, kind, data, prev, hash, sig FROM audit ORDER BY seq")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (seq, ts, kind, data, prev, hash, sig) = row?;
+        // Unparseable data is kept as a string so verification reports the
+        // entry as altered instead of failing to run.
+        let data = canonical::parse_strict(&data).unwrap_or(Value::String(data));
+        out.push((
+            Entry {
+                seq: seq as u64,
+                ts: ts as u64,
+                kind,
+                data,
+                prev,
+                hash,
+            },
+            sig,
+        ));
+    }
+    Ok(out)
+}
+
+fn read_checkpoints(conn: &Connection) -> Result<Vec<Checkpoint>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT seq, hash, ts, kid, sig FROM checkpoints ORDER BY seq")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Checkpoint {
+            seq: r.get::<_, i64>(0)? as u64,
+            hash: r.get(1)?,
+            ts: r.get::<_, i64>(2)? as u64,
+            kid: r.get(3)?,
+            sig: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn read_state(conn: &Connection) -> Result<StoredState> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id, c.project, c.approver, c.kind, c.public_key FROM credentials c \
+         JOIN approvers a ON a.project = c.project AND a.id = c.approver \
+         WHERE c.revoked_at IS NULL AND a.disabled_at IS NULL",
+    )?;
+    let credentials = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut stmt =
+        conn.prepare_cached("SELECT project, id FROM api_keys WHERE revoked_at IS NULL")?;
+    let api_keys = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut stmt = conn.prepare_cached("SELECT id, state FROM challenges")?;
+    let challenges = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut stmt = conn.prepare_cached("SELECT id FROM receipts WHERE consumed_at IS NOT NULL")?;
+    let consumed = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut stmt = conn.prepare_cached("SELECT id, policy FROM projects")?;
+    let mut policies = BTreeMap::new();
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (project, text) = row?;
+        policies.insert(
+            project,
+            canonical::parse_strict(&text).unwrap_or(Value::String(text)),
+        );
+    }
+    Ok(StoredState {
+        credentials,
+        api_keys,
+        challenges,
+        consumed,
+        policies,
+    })
+}
+
 pub struct Service {
     inner: Arc<Inner>,
     store: Store,
@@ -734,6 +1027,7 @@ impl Service {
             key,
             config: config.clone(),
             verified: Mutex::new(HashSet::new()),
+            closed: Mutex::new(HashMap::new()),
         };
         Ok(Service {
             inner: Arc::new(inner),
@@ -992,15 +1286,20 @@ impl Service {
         let token = B64.encode(secret);
         let mut challenge = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut challenge);
+        let challenge = B64.encode(challenge);
         let hash = token_hash(&token);
+        let expires_at = now + ENROLLMENT_TTL;
         let (inner, project, approver) =
             (self.inner.clone(), project.to_owned(), approver.to_owned());
         self.store.write(move |conn| {
             approver_active(conn, &project, &approver)?;
+            let seal =
+                inner.seal(&enrollment_fields(&hash, &project, &approver, &challenge, expires_at));
             exec(
                 conn,
-                "INSERT INTO enrollments (token_hash, project, approver, challenge, expires_at) VALUES (?, ?, ?, ?, ?)",
-                params![hash, project, approver, B64.encode(challenge), (now + ENROLLMENT_TTL) as i64],
+                "INSERT INTO enrollments (token_hash, project, approver, challenge, expires_at, seal) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![hash, project, approver, challenge, expires_at as i64, seal],
             )?;
             inner.audit(
                 conn,
@@ -1022,7 +1321,8 @@ impl Service {
     pub fn enrollment_view(&self, token: &str, now: u64) -> Result<EnrollmentView> {
         let (inner, token) = (self.inner.clone(), token.to_owned());
         self.store.read(move |conn| {
-            let (project, approver, challenge, expires_at) = open_enrollment(conn, &token, now)?;
+            let (project, approver, challenge, expires_at) =
+                inner.open_enrollment(conn, &token, now)?;
             let project_name = one(
                 conn,
                 "SELECT name FROM projects WHERE id = ?",
@@ -1066,7 +1366,7 @@ impl Service {
         let (inner, token) = (self.inner.clone(), token.to_owned());
         self.store.write(move |conn| {
             let rp = inner.config.relying_party()?;
-            let (project, approver, challenge, _) = open_enrollment(conn, &token, now)?;
+            let (project, approver, challenge, _) = inner.open_enrollment(conn, &token, now)?;
             approver_active(conn, &project, &approver)?;
             let challenge = B64.decode(challenge).map_err(internal)?;
             let external_id = passkey::verify_registration(
@@ -1226,7 +1526,9 @@ impl Service {
                 requirements,
                 expires_at,
                 receipt: None,
+                seal: None,
             };
+            inner.reseal(conn, &mut row)?;
             if state == "pending" {
                 let binding = row.binding();
                 let data = json!({
@@ -1238,7 +1540,7 @@ impl Service {
                     "approve_url": inner.approve_url(&row.id),
                     "rule": row.rule,
                 });
-                emit(conn, now, &row.project, "challenge.pending", data)?;
+                inner.emit(conn, now, &row.project, "challenge.pending", data)?;
             }
             if state == "allowed" {
                 let token =
@@ -1318,15 +1620,19 @@ impl Service {
         self.store.write(move |conn| {
             let denied = || Error::Forbidden("credential or signature not accepted".into());
             let mut row = fetch(conn, &id)?;
+            inner.intact(&row)?;
             if row.overdue(now) {
                 return Err(Error::Conflict("challenge is expired".into()));
             }
             if row.state != "pending" {
                 return Err(Error::Conflict(format!("challenge is {}", row.state)));
             }
-            let (column, lookup) = match &proof {
-                Proof::Signature { credential, .. } => ("c.id", credential),
-                Proof::Passkey { credential_id, .. } => ("c.external_id", credential_id),
+            // The proof exactly as it is kept in the audit log and in the receipt.
+            let (column, lookup, stored_proof) = match &proof {
+                Proof::Signature { credential, signature } => ("c.id", credential, signature.clone()),
+                Proof::Passkey { credential_id, assertion } => {
+                    ("c.external_id", credential_id, assertion.encode())
+                }
             };
             let found = one(
                 conn,
@@ -1372,36 +1678,17 @@ impl Service {
 
             let binding = row.binding();
             let message = if reject { binding.reject_hash() } else { binding.hash() };
-            // The proof as it is kept in the audit log and carried in the receipt.
-            let stored_proof = match (kind, &proof) {
-                (
-                    ApproverKind::Ed25519 | ApproverKind::Cosigner,
-                    Proof::Signature { signature, .. },
-                ) => {
-                    let bytes = B64.decode(signature).map_err(|_| denied())?;
-                    let valid = keys::public_from_hex(&public_key)
-                        .is_ok_and(|key| keys::verify(&key, &message, &bytes));
-                    if !valid {
-                        return Err(denied());
-                    }
-                    signature.clone()
-                }
-                (ApproverKind::Passkey, Proof::Passkey { assertion, .. }) => {
-                    let rp = inner.config.relying_party()?;
-                    let spki = hex::decode(&public_key).map_err(internal)?;
-                    let received = passkey::verify_proof(&rp, &spki, &message, assertion)
-                        .map_err(|_| denied())?;
-                    let stored = u32::try_from(counter).map_err(internal)?;
-                    passkey::check_counter(stored, received).map_err(|_| denied())?;
-                    exec(
-                        conn,
-                        "UPDATE credentials SET counter = ? WHERE id = ?",
-                        params![i64::from(received), credential],
-                    )?;
-                    assertion.encode()
-                }
-                _ => return Err(denied()),
-            };
+            let received =
+                inner.proof_valid(kind, &public_key, &message, &stored_proof).ok_or_else(denied)?;
+            if kind == ApproverKind::Passkey {
+                let stored = u32::try_from(counter).map_err(internal)?;
+                passkey::check_counter(stored, received).map_err(|_| denied())?;
+                exec(
+                    conn,
+                    "UPDATE credentials SET counter = ? WHERE id = ?",
+                    params![i64::from(received), credential],
+                )?;
+            }
 
             let evidence = json!({ "project": row.project, "challenge": row.id, "approver": approver,
                                    "credential": credential, "kind": kind.as_str(), "sig": stored_proof });
@@ -1411,9 +1698,11 @@ impl Service {
                     "UPDATE challenges SET state = 'rejected', decided_at = ? WHERE id = ?",
                     params![now as i64, row.id],
                 )?;
-                inner.audit(conn, now, "challenge.rejected", evidence)?;
                 row.state = "rejected".into();
-                emit(
+                inner.close(&row.id, row.expires_at, now);
+                inner.reseal(conn, &mut row)?;
+                inner.audit(conn, now, "challenge.rejected", evidence)?;
+                inner.emit(
                     conn,
                     now,
                     &row.project,
@@ -1430,7 +1719,9 @@ impl Service {
                 if inserted == 1 {
                     inner.audit(conn, now, "approval.accepted", evidence)?;
                 }
-                let approvals = approvals_of(conn, &row.id)?;
+                // Every stored approval is verified again here, so only real
+                // signatures over this challenge are counted.
+                let approvals = inner.approvals(conn, &row)?;
                 let facts: Vec<ApprovalFact> = approvals
                     .iter()
                     .map(|(a, _)| ApprovalFact { approver: a.approver.clone(), kind: a.kind })
@@ -1451,7 +1742,9 @@ impl Service {
                         params![now as i64, row.id],
                     )?;
                     row.state = "approved".into();
-                    emit(
+                    inner.close(&row.id, row.expires_at, now);
+                    inner.reseal(conn, &mut row)?;
+                    inner.emit(
                         conn,
                         now,
                         &row.project,
@@ -1478,6 +1771,10 @@ impl Service {
         }
         let (inner, project) = (self.inner.clone(), project.to_owned());
         self.store.write(move |conn| {
+            // Also refused from memory, in case the mark in the table was erased.
+            if inner.is_closed(&payload.id) {
+                return Err(Error::Conflict("receipt was already used".into()));
+            }
             let changed = exec(
                 conn,
                 "UPDATE receipts SET consumed_at = ? WHERE id = ? AND project = ? AND consumed_at IS NULL",
@@ -1501,6 +1798,7 @@ impl Service {
                 "receipt.consumed",
                 json!({ "project": project, "receipt": payload.id, "challenge": payload.challenge }),
             )?;
+            inner.close(&payload.id, payload.expires_at, now);
             Ok(payload)
         })
     }
@@ -1518,105 +1816,73 @@ impl Service {
 
     pub fn audit_entries(&self) -> Result<Vec<Entry>> {
         Ok(self
-            .audit_rows()?
+            .store
+            .read(read_audit)?
             .into_iter()
             .map(|(entry, _)| entry)
             .collect())
     }
 
-    fn audit_rows(&self) -> Result<Vec<(Entry, String)>> {
-        self.store.read(|conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT seq, ts, kind, data, prev, hash, sig FROM audit ORDER BY seq",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (seq, ts, kind, data, prev, hash, sig) = row?;
-                // Unparseable data is kept as a string so verification reports
-                // the entry as altered instead of failing to run.
-                let data = canonical::parse_strict(&data).unwrap_or(Value::String(data));
-                out.push((
-                    Entry {
-                        seq: seq as u64,
-                        ts: ts as u64,
-                        kind,
-                        data,
-                        prev,
-                        hash,
-                    },
-                    sig,
-                ));
-            }
-            Ok(out)
-        })
-    }
-
     pub fn checkpoints(&self) -> Result<Vec<Checkpoint>> {
-        self.store.read(|conn| {
-            let mut stmt = conn
-                .prepare_cached("SELECT seq, hash, ts, kid, sig FROM checkpoints ORDER BY seq")?;
-            let rows = stmt.query_map([], |r| {
-                Ok(Checkpoint {
-                    seq: r.get::<_, i64>(0)? as u64,
-                    hash: r.get(1)?,
-                    ts: r.get::<_, i64>(2)? as u64,
-                    kid: r.get(3)?,
-                    sig: r.get(4)?,
-                })
-            })?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
-        })
+        self.store.read(read_checkpoints)
     }
 
-    /// Verifies the hash chain, every entry signature, every stored
-    /// checkpoint, and that the credentials and API keys in use are exactly
-    /// the ones the log says were granted. Returns the head of the log.
+    /// Verifies the hash chain, every entry signature and every stored
+    /// checkpoint, then replays the log and checks that what the database
+    /// says now is what the log says happened: which credentials and API keys
+    /// are active, the state of every challenge, and which receipts were
+    /// used. Returns the head of the log.
     pub fn audit_verify(&self) -> Result<Option<(u64, String)>> {
-        let rows = self.audit_rows()?;
+        // One snapshot for everything, so a write landing in the middle
+        // cannot look like tampering.
+        let (rows, checkpoints, stored) = self.store.read(|conn| {
+            Ok((
+                read_audit(conn)?,
+                read_checkpoints(conn)?,
+                read_state(conn)?,
+            ))
+        })?;
+        let broken = |message: String| Error::Conflict(message);
         let public = &self.inner.public;
         for (entry, sig) in &rows {
             if !audit::entry_signature_valid(public, &entry.hash, sig) {
-                return Err(Error::Conflict(format!(
+                return Err(broken(format!(
                     "entry {}: not signed by this server",
                     entry.seq
                 )));
             }
         }
         let entries: Vec<Entry> = rows.into_iter().map(|(entry, _)| entry).collect();
-        let head = audit::verify_chain(&entries).map_err(|e| Error::Conflict(e.to_string()))?;
-        for checkpoint in self.checkpoints()? {
+        let head = audit::verify_chain(&entries).map_err(|e| broken(e.to_string()))?;
+        for checkpoint in checkpoints {
             let signed =
                 checkpoint.kid == self.inner.key.kid() && checkpoint.signature_valid(public);
             if !signed {
-                return Err(Error::Conflict(format!(
+                return Err(broken(format!(
                     "checkpoint at {} has an invalid signature",
                     checkpoint.seq
                 )));
             }
             checkpoint
                 .matches(&entries)
-                .map_err(|e| Error::Conflict(e.to_string()))?;
+                .map_err(|e| broken(e.to_string()))?;
         }
 
-        // Replay the log into the set of grants that should be active now.
         let text = |entry: &Entry, field: &str| entry.data[field].as_str().unwrap_or("").to_owned();
-        let mut credentials: BTreeMap<String, CredentialRecord> = BTreeMap::new();
-        let mut api_keys: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut expected = StoredState::default();
         for entry in &entries {
             match entry.kind.as_str() {
+                "project.created" => {
+                    let nothing = serde_json::to_value(Policy::deny_all()).map_err(internal)?;
+                    expected.policies.insert(text(entry, "project"), nothing);
+                }
+                "policy.set" => {
+                    expected
+                        .policies
+                        .insert(text(entry, "project"), entry.data["policy"].clone());
+                }
                 "credential.added" => {
-                    credentials.insert(
+                    expected.credentials.insert(
                         text(entry, "credential"),
                         (
                             text(entry, "project"),
@@ -1627,49 +1893,68 @@ impl Service {
                     );
                 }
                 "credential.revoked" => {
-                    credentials.remove(&text(entry, "credential"));
+                    expected.credentials.remove(&text(entry, "credential"));
                 }
                 "approver.disabled" => {
                     let (project, approver) = (text(entry, "project"), text(entry, "approver"));
-                    credentials.retain(|_, c| !(c.0 == project && c.1 == approver));
+                    expected
+                        .credentials
+                        .retain(|_, c| !(c.0 == project && c.1 == approver));
                 }
                 "apikey.created" => {
-                    api_keys.insert((text(entry, "project"), text(entry, "key")));
+                    expected
+                        .api_keys
+                        .insert((text(entry, "project"), text(entry, "key")));
                 }
                 "apikey.revoked_all" => {
                     let project = text(entry, "project");
-                    api_keys.retain(|(p, _)| *p != project);
+                    expected.api_keys.retain(|(p, _)| *p != project);
+                }
+                "challenge.created" => {
+                    expected
+                        .challenges
+                        .insert(text(entry, "challenge"), text(entry, "state"));
+                }
+                "challenge.rejected" => {
+                    expected
+                        .challenges
+                        .insert(text(entry, "challenge"), "rejected".into());
+                }
+                "challenge.expired" => {
+                    expected
+                        .challenges
+                        .insert(text(entry, "challenge"), "expired".into());
+                }
+                "receipt.issued" => {
+                    // A receipt for a challenge that was waiting means it was approved.
+                    if let Some(state) = expected.challenges.get_mut(&text(entry, "challenge")) {
+                        if state == "pending" {
+                            *state = "approved".into();
+                        }
+                    }
+                }
+                "receipt.consumed" => {
+                    expected.consumed.insert(text(entry, "receipt"));
                 }
                 _ => {}
             }
         }
-        let (stored_credentials, stored_keys) = self.store.read(|conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT c.id, c.project, c.approver, c.kind, c.public_key FROM credentials c \
-                 JOIN approvers a ON a.project = c.project AND a.id = c.approver \
-                 WHERE c.revoked_at IS NULL AND a.disabled_at IS NULL",
-            )?;
-            let credentials = stmt
-                .query_map([], |r| {
-                    Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-                })?
-                .collect::<rusqlite::Result<BTreeMap<String, CredentialRecord>>>()?;
-            let mut stmt =
-                conn.prepare_cached("SELECT project, id FROM api_keys WHERE revoked_at IS NULL")?;
-            let keys = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<BTreeSet<(String, String)>>>()?;
-            Ok((credentials, keys))
-        })?;
-        if stored_credentials != credentials {
-            return Err(Error::Conflict(
+        if stored.policies != expected.policies {
+            return Err(broken("policies do not match the audit log".into()));
+        }
+        if stored.credentials != expected.credentials {
+            return Err(broken(
                 "approver credentials do not match the audit log".into(),
             ));
         }
-        if stored_keys != api_keys {
-            return Err(Error::Conflict(
-                "API keys do not match the audit log".into(),
-            ));
+        if stored.api_keys != expected.api_keys {
+            return Err(broken("API keys do not match the audit log".into()));
+        }
+        if stored.challenges != expected.challenges {
+            return Err(broken("challenges do not match the audit log".into()));
+        }
+        if stored.consumed != expected.consumed {
+            return Err(broken("used receipts do not match the audit log".into()));
         }
         Ok(head)
     }
@@ -1745,6 +2030,28 @@ impl Service {
                 &format!("UPDATE channels SET {column} = ? WHERE project = ?"),
                 params![value, project],
             )?;
+            let (webhook, telegram) = one(
+                conn,
+                "SELECT webhook_url, telegram_chat FROM channels WHERE project = ?",
+                [&project],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )?
+            .ok_or(Error::NotFound)?;
+            let seal = inner.seal(&channel_fields(
+                &project,
+                webhook.as_deref(),
+                telegram.as_deref(),
+            ));
+            exec(
+                conn,
+                "UPDATE channels SET seal = ? WHERE project = ?",
+                params![seal, project],
+            )?;
             inner.audit(
                 conn,
                 now,
@@ -1757,7 +2064,7 @@ impl Service {
     pub fn outbox_due(&self, now: u64, limit: u32) -> Result<Vec<OutboxItem>> {
         self.store.read(move |conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, kind, target, body FROM outbox WHERE done_at IS NULL AND next_at <= ? \
+                "SELECT id, kind, target, body, seal FROM outbox WHERE done_at IS NULL AND next_at <= ? \
                  ORDER BY id LIMIT ?",
             )?;
             let rows = stmt.query_map(params![now as i64, limit], |r| {
@@ -1766,9 +2073,32 @@ impl Service {
                     kind: r.get(1)?,
                     target: r.get(2)?,
                     body: r.get(3)?,
+                    seal: r.get(4)?,
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// True when this server queued the item exactly as it is. An item
+    /// someone inserted or redirected in the table must not be delivered:
+    /// it would be signed and sent in the server's name.
+    pub fn outbox_authentic(&self, item: &OutboxItem) -> bool {
+        self.inner.sealed(
+            &outbox_fields(&item.kind, &item.target, &item.body),
+            item.seal.as_deref(),
+        )
+    }
+
+    /// Drops an item without delivering it.
+    pub fn outbox_discard(&self, id: i64, now: u64) -> Result<()> {
+        self.store.write(move |conn| {
+            exec(
+                conn,
+                "UPDATE outbox SET failed = 1, done_at = ? WHERE id = ?",
+                params![now as i64, id],
+            )?;
+            Ok(())
         })
     }
 

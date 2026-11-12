@@ -90,6 +90,10 @@ test("authorize waits, verifies the receipt, and reports refusals", async () => 
     script.push(respond({ id: "ch_x", state: "allowed", receipt: r.token }));
     await assert.rejects(client.authorize(r.other_action, { idempotencyKey: "k2" }), code("action_mismatch"));
 
+    // A genuine receipt for this same action, but issued for another request.
+    script.push(respond({ id: "ch_other", state: "allowed", receipt: r.token }));
+    await assert.rejects(client.authorize(r.action, { idempotencyKey: "k2b" }), code("action_mismatch"));
+
     script.push(respond({ id: "ch_y", state: "rejected", receipt: null }));
     assert.equal((await client.authorize(r.action, { idempotencyKey: "k3" })).authorized, false);
 

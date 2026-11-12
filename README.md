@@ -168,7 +168,7 @@ A complete example is in [examples/policy.json](examples/policy.json).
 | Kind | What it is |
 |---|---|
 | `passkey` | fingerprint, face or PIN on a phone or computer, through the built in page |
-| `ed25519` | a device key for command line or app approvers (`twof device keygen`, `twof device sign`) |
+| `ed25519` | a device key for command line or app approvers. `twof device approve` shows the action and signs the hash it computes itself |
 | `cosigner` | a second machine with its own key and its own policy (`twof cosign`) |
 | Telegram | a message with the approval link. It notifies; it never approves |
 | Webhooks | `challenge.pending`, `approved`, `rejected`, `expired`, signed with the server key |
@@ -179,10 +179,10 @@ A complete example is in [examples/policy.json](examples/policy.json).
 |---|---|
 | **Bound to the action** | Receipts and approvals cover the SHA-256 of a canonical form. Change one digit of the amount and nothing verifies. |
 | **Nothing to steal in the database** | Public keys and hashes only. The signing key lives outside it. |
-| **Nothing to plant in the database** | Credentials, API keys and policies are sealed with the server key. A row written by someone else is ignored; an edited policy denies everything. |
+| **Nothing to plant in the database** | Credentials, API keys, policies, enrollment links and every challenge are sealed with the server key. A row written by someone else is ignored; an edited policy denies everything; a planted approval does not count. |
 | **Signed audit log** | Hash chained and signed entry by entry. `twof audit verify` reports edits, deletions and grants that the log does not explain. |
-| **Does not trust itself** | Clients can pin approver keys and check their signatures inside the receipt, so even a compromised 2F server cannot invent an approval. |
-| **Fast** | Group commit and a read pool: about 4,400 durable authorizations per second and 450,000 reads per second in the [benchmark](docs/ARCHITECTURE.md#7-why-it-is-fast), on a laptop. |
+| **Does not trust itself** | Clients can pin device and co-signer keys and check their signatures inside the receipt, and the approval page and terminal approver recompute what they sign, so even a compromised 2F server cannot invent one of those approvals. |
+| **Fast** | Group commit and a read pool: about 3,000 durable authorizations per second and 450,000 reads per second in the [benchmark](docs/ARCHITECTURE.md#7-why-it-is-fast), on a laptop. |
 
 ## Deploying
 

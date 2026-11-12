@@ -169,6 +169,11 @@ export class TwoF {
       return { authorized: false, state: challenge.state, receipt: null, payload: null, challenge };
     }
     const payload = verifyReceipt(challenge.receipt, this.publicKeys, action);
+    // A valid receipt for the same action, but from some other request, is
+    // not the answer to this one.
+    if (payload.challenge !== challenge.id) {
+      throw new TwoFError("action_mismatch", "receipt belongs to a different challenge");
+    }
     return { authorized: true, state: challenge.state, receipt: challenge.receipt, payload, challenge };
   }
 

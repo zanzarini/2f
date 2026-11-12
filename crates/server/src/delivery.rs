@@ -52,6 +52,15 @@ pub fn run_once(service: &Shared, telegram_token: Option<&str>) -> usize {
     };
     let mut delivered = 0;
     for item in items {
+        // Only what this server queued itself goes out under its name.
+        if !service.outbox_authentic(&item) {
+            eprintln!(
+                "outbox: dropped item {} that this server did not queue",
+                item.id
+            );
+            let _ = service.outbox_discard(item.id, now());
+            continue;
+        }
         let ok = deliver(service, &item, telegram_token);
         delivered += usize::from(ok);
         if let Err(e) = service.outbox_result(item.id, ok, now()) {

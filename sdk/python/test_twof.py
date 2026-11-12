@@ -87,6 +87,8 @@ class Vectors(unittest.TestCase):
 
             script.append({"id": "ch_x", "state": "allowed", "receipt": R["token"]})
             self.assert_code("action_mismatch", client.authorize, R["other_action"], "k2")
+            script.append({"id": "ch_other", "state": "allowed", "receipt": R["token"]})
+            self.assert_code("action_mismatch", client.authorize, R["action"], "k2b")
             script.append({"id": "ch_y", "state": "rejected", "receipt": None})
             self.assertFalse(client.authorize(R["action"], "k3").authorized)
         finally:

@@ -189,8 +189,29 @@ enum AuditCmd {
 enum DeviceCmd {
     /// Create an approver device key and print its public key.
     Keygen { file: PathBuf },
-    /// Sign a binding hash (base64url, from the approval view) with a device key.
+    /// Low level: sign a hash (base64url) without seeing what it stands for.
+    /// Prefer `approve`, which shows the action and computes the hash itself.
     Sign { file: PathBuf, hash: String },
+    /// Show a pending action and approve or refuse it with a device key.
+    /// The hash that gets signed is computed here from the action shown,
+    /// never taken from the server.
+    Approve {
+        /// The device key, created with `twof device keygen`.
+        file: PathBuf,
+        /// Credential id printed by `twof credential add`.
+        credential: String,
+        /// The challenge id (the last part of the approval link).
+        challenge: String,
+        /// Address of the 2F server.
+        #[arg(long, env = "TWOF_PUBLIC_URL", default_value = "http://localhost:8722")]
+        server_url: String,
+        /// Refuse instead of approving.
+        #[arg(long)]
+        reject: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -233,7 +254,30 @@ fn server_key(cli: &Cli) -> AnyResult<ServerKey> {
     }
 }
 
+/// Keeps a file private to its owner, where the system supports it.
+fn restrict(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 fn read_key(path: &Path) -> AnyResult<ServerKey> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.permissions().mode() & 0o077 != 0 {
+                eprintln!(
+                    "warning: {} can be read by other users of this machine; run chmod 600 on it",
+                    path.display()
+                );
+            }
+        }
+    }
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read key file {}: {e}", path.display()))?;
     Ok(ServerKey::from_seed_hex(&text)
@@ -257,6 +301,7 @@ fn run(cli: Cli) -> AnyResult<()> {
             write_secret(&cli.key_file, &key.seed_hex())?;
             let public = key.public_hex();
             Service::open(&cli.db, key, Config::default())?;
+            restrict(&cli.db);
             println!("database:   {}", cli.db.display());
             println!(
                 "key file:   {}  (secret, back it up separately)",
@@ -286,6 +331,7 @@ fn run(cli: Cli) -> AnyResult<()> {
                     write_secret(&cli.key_file, &ServerKey::generate().seed_hex())?;
                 }
                 Service::open(&cli.db, server_key(&cli)?, Config::default())?;
+                restrict(&cli.db);
                 println!("created {}", cli.db.display());
             }
             let service = Arc::new(open(&cli, config)?);
@@ -322,14 +368,14 @@ fn run(cli: Cli) -> AnyResult<()> {
         } => {
             let text = std::fs::read_to_string(policy)
                 .map_err(|e| format!("cannot read {}: {e}", policy.display()))?;
-            let cosigner = Arc::new(twof_server::cosigner::Cosigner {
-                key: read_key(device_key)?,
-                credential: credential.clone(),
-                policy: twof_core::Policy::parse(&text)?,
-                server_url: server_url.clone(),
-                server_key: twof_core::keys::public_from_hex(server_public_key)
+            let cosigner = Arc::new(twof_server::cosigner::Cosigner::new(
+                read_key(device_key)?,
+                credential.clone(),
+                twof_core::Policy::parse(&text)?,
+                server_url.clone(),
+                twof_core::keys::public_from_hex(server_public_key)
                     .map_err(|_| "server public key must be 32 bytes of hex")?,
-            });
+            ));
             println!("2F co-signer listening on http://{listen}/webhook");
             tokio::runtime::Runtime::new()?
                 .block_on(twof_server::cosigner::serve(cosigner, *listen))?;
@@ -443,6 +489,59 @@ fn run(cli: Cli) -> AnyResult<()> {
                 return Err("hash must be 32 bytes".into());
             }
             println!("{}", B64.encode(read_key(file)?.sign(&bytes)));
+        }
+        Command::Device(DeviceCmd::Approve {
+            file,
+            credential,
+            challenge,
+            server_url,
+            reject,
+            yes,
+        }) => {
+            let key = read_key(file)?;
+            let fetched = twof_server::device::fetch(server_url, challenge)?;
+            let action = &fetched.action;
+            let shown = |value: &Option<String>| value.clone().unwrap_or_else(|| "-".into());
+            // Control characters from the network never reach the terminal.
+            let name: String = fetched
+                .project_name
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect();
+            println!("project:     {name}");
+            println!("operation:   {}", action.kind);
+            println!(
+                "amount:      {} {}",
+                shown(&action.amount),
+                shown(&action.asset)
+            );
+            println!("destination: {}", shown(&action.destination));
+            for (name, value) in action.meta.iter().flatten() {
+                println!("note {name}: {value}");
+            }
+            if fetched.state != "pending" {
+                return Err(format!("this challenge is {}", fetched.state).into());
+            }
+            let verb = if *reject { "REFUSE" } else { "APPROVE" };
+            if !*yes {
+                eprint!("{verb} this? Type yes to confirm: ");
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if answer.trim() != "yes" {
+                    return Err("nothing was signed".into());
+                }
+            }
+            // Signed over the hash computed here, from what was just shown.
+            let hash = if *reject {
+                fetched.binding.reject_hash()
+            } else {
+                fetched.binding.hash()
+            };
+            let signature = B64.encode(key.sign(&hash));
+            let state = twof_server::device::submit(
+                server_url, challenge, credential, &signature, *reject,
+            )?;
+            println!("challenge is now {state}");
         }
     }
     Ok(())

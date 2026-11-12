@@ -19,7 +19,7 @@ const SERVER_POLICY: &str = r#"{ "version": 1, "rules": [
 /// The co-signer has its own, stricter view of the world.
 const VAULT_POLICY: &str = r#"{ "version": 1, "lists": { "known": ["0xaaa"] }, "rules": [
     { "name": "blocked", "when": { "destination_in": ["known"], "amount_min": "1000000" }, "then": { "decision": "deny" } },
-    { "name": "known up to 5000", "when": { "destination_in": ["known"], "amount_max": "5000" }, "then": { "decision": "allow" } },
+    { "name": "known up to 5000", "when": { "asset": ["USDT"], "destination_in": ["known"], "amount_max": "5000" }, "then": { "decision": "allow" } },
     { "name": "unsure", "when": { "asset": ["BTC"] }, "then": { "decision": "require", "requirements": [ { "count": 1 } ] } } ] }"#;
 
 struct World {
@@ -60,13 +60,13 @@ fn world() -> World {
             T0,
         )
         .unwrap();
-    let vault = Cosigner {
-        key: vault_key,
-        credential: vault_cred,
-        policy: Policy::parse(VAULT_POLICY).unwrap(),
-        server_url: "http://unused".into(),
-        server_key: svc.key().public(),
-    };
+    let vault = Cosigner::new(
+        vault_key,
+        vault_cred,
+        Policy::parse(VAULT_POLICY).unwrap(),
+        "http://unused".into(),
+        svc.key().public(),
+    );
     World {
         svc,
         project,
@@ -310,4 +310,102 @@ fn cosigner_refuses_forged_stale_or_inconsistent_webhooks() {
         w.svc.get_challenge(&w.project, &evil.id, T0).unwrap().state,
         "pending"
     );
+}
+
+#[test]
+fn cosigner_keeps_its_own_running_total() {
+    let w = world();
+    let policy = r#"{ "version": 1, "rules": [
+        { "name": "capped", "when": { "asset": ["USDT"], "amount_max": "3000",
+                                      "velocity": { "window_secs": 3600, "max_total": "6000" } },
+          "then": { "decision": "allow" } } ] }"#;
+    let vault = Cosigner::new(
+        ServerKey::generate(),
+        "cr_x".into(),
+        Policy::parse(policy).unwrap(),
+        "http://unused".into(),
+        w.svc.key().public(),
+    );
+    let mut deliveries = Vec::new();
+    for key in ["k1", "k2", "k3"] {
+        w.svc
+            .create_challenge(&w.project, withdraw("2500", "USDT", "0xaaa"), key, T0)
+            .unwrap();
+        deliveries.push(next_webhook(&w));
+    }
+    // A compromised server asking for many approvals that each look small.
+    let decide = |i: usize| {
+        vault
+            .decide(&deliveries[i].0, &deliveries[i].1, T0)
+            .unwrap()
+            .unwrap()
+    };
+    assert!(!decide(0).reject);
+    assert!(!decide(1).reject);
+    assert!(
+        decide(2).reject,
+        "2500 + 2500 + 2500 is over the co-signer's own 6000"
+    );
+    // Hearing about the same challenge again does not use the budget twice.
+    assert!(!decide(0).reject);
+    assert!(!decide(1).reject);
+    assert!(decide(2).reject);
+}
+
+#[test]
+fn notifications_planted_in_the_database_are_not_sent_in_the_servers_name() {
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!("twof-outbox-{}.db", std::process::id()));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", p.display()));
+        }
+        p
+    };
+    let svc = Service::open(&path, ServerKey::generate(), Config::default()).unwrap();
+    let project = svc.create_project("exchange", T0).unwrap();
+    svc.set_policy(&project, SERVER_POLICY, T0).unwrap();
+    svc.set_webhook(&project, Some("http://vault.internal:8723/webhook"), T0)
+        .unwrap();
+    svc.create_challenge(&project, withdraw("100", "USDT", "0xaaa"), "k1", T0)
+        .unwrap();
+    let real = svc.outbox_due(T0, 10).unwrap();
+    assert_eq!(real.len(), 1);
+    assert!(svc.outbox_authentic(&real[0]));
+
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.busy_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    // A forged event, with the seal copied from the real one.
+    raw.execute(
+        "INSERT INTO outbox (project, kind, target, body, seal, next_at) \
+         SELECT project, 'webhook', target, '{\"event\":\"challenge.approved\"}', seal, 0 FROM outbox",
+        [],
+    )
+    .unwrap();
+    // The real event, redirected to the attacker.
+    raw.execute(
+        "UPDATE outbox SET target = 'http://evil.example/collect' WHERE id = ?",
+        [real[0].id],
+    )
+    .unwrap();
+    let items = svc.outbox_due(T0, 10).unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|item| !svc.outbox_authentic(item)));
+
+    // Redirecting future notifications by editing the channel is ignored too:
+    // nothing is queued for a destination this server did not set.
+    raw.execute("DELETE FROM outbox", []).unwrap();
+    raw.execute(
+        "UPDATE channels SET webhook_url = 'http://evil.example/collect'",
+        [],
+    )
+    .unwrap();
+    svc.create_challenge(&project, withdraw("100", "USDT", "0xaaa"), "k2", T0)
+        .unwrap();
+    assert!(svc.outbox_due(T0, 10).unwrap().is_empty());
+    drop(svc);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }

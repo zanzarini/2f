@@ -4,6 +4,7 @@
 
 pub mod cosigner;
 pub mod delivery;
+pub mod device;
 pub mod error;
 pub mod http;
 pub mod limit;

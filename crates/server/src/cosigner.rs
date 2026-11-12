@@ -4,6 +4,10 @@
 //!
 //! Its value is independence: taking over the 2F server is not enough to get
 //! its signature on an action its policy refuses. Run it on another machine.
+//!
+//! It keeps its own count of what it has signed, so a velocity limit in its
+//! policy also holds against a server that asks for many small approvals.
+//! That count lives in memory: it starts from zero when the process restarts.
 
 use crate::error::{Error, Result};
 use axum::extract::State;
@@ -15,11 +19,21 @@ use base64::Engine;
 use ed25519_dalek::VerifyingKey;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use twof_core::keys::ServerKey;
 use twof_core::policy::{Outcome, PolicyContext};
 use twof_core::{canonical, webhook, Action, Binding, Policy};
+
+/// How long a signed approval is remembered for velocity limits.
+const HISTORY_SECS: u64 = 31 * 24 * 3600;
+
+struct Signed {
+    challenge: String,
+    asset: String,
+    amount: Decimal,
+    at: u64,
+}
 
 pub struct Cosigner {
     /// The co-signer's own signing key.
@@ -32,6 +46,7 @@ pub struct Cosigner {
     pub server_url: String,
     /// The 2F server key, pinned. Webhooks signed by anything else are dropped.
     pub server_key: VerifyingKey,
+    signed: Mutex<Vec<Signed>>,
 }
 
 /// What the co-signer decided to send back to the server.
@@ -42,20 +57,48 @@ pub struct Verdict {
     pub signature: String,
 }
 
-struct Clock(u64);
+struct History<'a> {
+    now: u64,
+    signed: &'a [Signed],
+    /// The challenge being decided, so deciding it twice does not count twice.
+    current: &'a str,
+}
 
-impl PolicyContext for Clock {
+impl PolicyContext for History<'_> {
     fn now_unix(&self) -> u64 {
-        self.0
+        self.now
     }
-    /// The co-signer keeps no history, so velocity conditions never match.
-    fn velocity_total(&self, _asset: &str, _window_secs: u64) -> Option<Decimal> {
-        None
+    fn velocity_total(&self, asset: &str, window_secs: u64) -> Option<Decimal> {
+        let since = self.now.saturating_sub(window_secs);
+        let mut total = Decimal::ZERO;
+        for entry in self.signed {
+            if entry.asset == asset && entry.at >= since && entry.challenge != self.current {
+                total = total.checked_add(entry.amount)?;
+            }
+        }
+        Some(total)
     }
 }
 
 impl Cosigner {
-    /// Decides on one webhook delivery. Pure: no network, no clock.
+    pub fn new(
+        key: ServerKey,
+        credential: String,
+        policy: Policy,
+        server_url: String,
+        server_key: VerifyingKey,
+    ) -> Self {
+        Cosigner {
+            key,
+            credential,
+            policy,
+            server_url,
+            server_key,
+            signed: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Decides on one webhook delivery. No network involved.
     pub fn decide(&self, body: &str, signature: &str, now: u64) -> Result<Option<Verdict>> {
         if !webhook::verify(&self.server_key, body.as_bytes(), signature) {
             return Err(Error::Forbidden("webhook signature is invalid".into()));
@@ -87,11 +130,35 @@ impl Cosigner {
         if binding.expires_at <= now {
             return Err(Error::Invalid("challenge has expired".into()));
         }
-        let (hash, reject) = match self.policy.evaluate(&action, &Clock(now)).outcome {
+
+        // Decide and record under one lock, so two deliveries arriving
+        // together cannot both fit under the same limit.
+        let mut signed = self.signed.lock().unwrap_or_else(|p| p.into_inner());
+        signed.retain(|entry| entry.at + HISTORY_SECS >= now);
+        let context = History {
+            now,
+            signed: &signed,
+            current: &binding.challenge,
+        };
+        let (hash, reject) = match self.policy.evaluate(&action, &context).outcome {
             Outcome::Allow => (binding.hash(), false),
             Outcome::Deny => (binding.reject_hash(), true),
             Outcome::Require { .. } => return Ok(None),
         };
+        if !reject
+            && !signed
+                .iter()
+                .any(|entry| entry.challenge == binding.challenge)
+        {
+            if let (Some(asset), Ok(Some(amount))) = (&action.asset, action.amount_decimal()) {
+                signed.push(Signed {
+                    challenge: binding.challenge.clone(),
+                    asset: asset.clone(),
+                    amount,
+                    at: now,
+                });
+            }
+        }
         Ok(Some(Verdict {
             challenge: binding.challenge,
             reject,
@@ -145,6 +212,11 @@ async fn receive(
         Some(_) => "approved",
     };
     if let Some(verdict) = verdict {
+        // The challenge id came from a signed webhook, but it still goes
+        // into a URL: only the shape the server generates is accepted.
+        if !crate::device::valid_challenge_id(&verdict.challenge) {
+            return Err(Error::Invalid("unexpected challenge id".into()));
+        }
         tokio::task::spawn_blocking(move || {
             if let Err(e) = cosigner.send(&verdict) {
                 eprintln!(

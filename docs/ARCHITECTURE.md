@@ -220,10 +220,10 @@ Measured with `cargo test --release -p twof-server --test bench -- --ignored
 
 | Operation | Throughput |
 |---|---|
-| Authenticate an API key | about 700,000 per second |
+| Authenticate an API key | about 750,000 per second |
 | Read a pending challenge | about 450,000 per second |
-| Create, allow by rule and issue a receipt (durable) | about 4,400 per second |
-| Create, approve with a signature and issue a receipt (durable) | about 1,900 per second |
+| Create, allow by rule and issue a receipt (durable) | about 3,000 per second |
+| Create, approve with a signature and issue a receipt (durable) | about 1,700 per second |
 
 These are in-process numbers for the service layer; HTTP adds its own cost,
 and your disk decides the write figures.
@@ -249,5 +249,7 @@ flowchart LR
 ```
 
 The database holds nothing that lets its reader act, and nothing its writer
-can change without the server noticing: credentials, API keys and policies are
-sealed with the server key and ignored when the seal does not verify.
+can use to grant themselves power: credentials, API keys, policies, enrollment
+links, notification settings and every challenge are sealed with the server
+key and refused when the seal does not verify. Stored approvals are verified
+again, signature by signature, whenever a quorum is counted.

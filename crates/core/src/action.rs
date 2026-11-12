@@ -94,6 +94,11 @@ impl Action {
         if !digits(int) || frac.is_some_and(|f| !digits(f)) {
             return invalid("amount must be a plain decimal string such as \"1500.25\"");
         }
+        // "0001000" reads as a thousand to a machine and as something else
+        // to a person in a hurry.
+        if int.len() > 1 && int.starts_with('0') {
+            return invalid("amount cannot have leading zeros");
+        }
         match Decimal::from_str_exact(text) {
             Ok(d) => Ok(Some(d)),
             Err(_) => invalid("amount is out of range"),
@@ -248,6 +253,8 @@ mod tests {
             r#"{"type":"x","amount":"1,000"}"#,
             r#"{"type":"x","amount":".5"}"#,
             r#"{"type":"x","amount":"5."}"#,
+            r#"{"type":"x","amount":"007"}"#,
+            r#"{"type":"x","amount":"00.5"}"#,
             r#"{"type":"x","amount":" 5"}"#,
             r#"{"type":"x","amount":""}"#,
             r#"{"type":"x","destination":" 0xabc"}"#,

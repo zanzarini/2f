@@ -80,6 +80,15 @@ expect "approved receipt is consumed" 200 "$(status "${AUTH[@]}" -d "{\"receipt\
 expect "second approval is a conflict" 409 "$(status -d "{\"credential\":\"$CRED\",\"signature\":\"$SIG\"}" "$URL/v1/challenges/$ID/approvals")"
 expect "response is not cacheable" 1 "$(curl -sI "$URL/v1/keys" | grep -ci 'cache-control: no-store')"
 
+# A terminal approver that computes the hash itself from the action it shows.
+TERM_ID="$(create '{"idempotency_key":"t1","action":{"type":"withdraw","amount":"321","asset":"USDT","destination":"0xterm"}}' | field "['id']")"
+SHOWN="$("$BIN" device approve "$WORK/alice.key" "$CRED" "$TERM_ID" --server-url "$URL" --yes)"
+expect "terminal approver shows the real amount" 1 "$(echo "$SHOWN" | grep -c 'amount:      321 USDT')"
+expect "terminal approver approves" 1 "$(echo "$SHOWN" | grep -c 'challenge is now approved')"
+REF_ID="$(create '{"idempotency_key":"t2","action":{"type":"withdraw","amount":"322","asset":"USDT","destination":"0xterm"}}' | field "['id']")"
+expect "terminal approver can refuse" 1 "$("$BIN" device approve "$WORK/alice.key" "$CRED" "$REF_ID" --server-url "$URL" --reject --yes | grep -c 'challenge is now rejected')"
+expect "terminal approver needs a confirmation" 0 "$(echo no | "$BIN" device approve "$WORK/alice.key" "$CRED" "$TERM_ID" --server-url "$URL" 2>/dev/null | grep -c 'challenge is now')"
+
 # The Python client against the live server, if its dependency is installed.
 if python3 -c "import cryptography" 2>/dev/null; then
   KID="$("$BIN" pubkey | awk '/kid/ { print $2 }')"
@@ -107,7 +116,7 @@ VAULT_PUB="$("$BIN" device keygen "$WORK/vault.key")"
 VAULT_CRED="$("$BIN" credential add "$PROJECT" vault "$VAULT_PUB" --cosigner)"
 cat > "$WORK/vault-policy.json" <<'JSON'
 { "version": 1, "rules": [
-  { "name": "small payouts", "when": { "type": ["payout"], "amount_max": "100" }, "then": { "decision": "allow" } } ] }
+  { "name": "small payouts", "when": { "type": ["payout"], "asset": ["USDT"], "amount_max": "100", "velocity": { "window_secs": 3600, "max_total": "120" } }, "then": { "decision": "allow" } } ] }
 JSON
 SERVER_PUB="$("$BIN" pubkey | awk '/public key/ { print $3 }')"
 VAULT_PORT=$((PORT + 1))
@@ -124,6 +133,8 @@ expect "payout waits for the co-signer" pending "$(echo "$PAY" | field "['state'
 PAY_ID="$(echo "$PAY" | field "['id']")"
 expect "co-signer approves within its policy" approved "$(curl -s "${AUTH[@]}" "$URL/v1/challenges/$PAY_ID?wait=15" | field "['state']")"
 BIGPAY_ID="$(create '{"idempotency_key":"p2","action":{"type":"payout","amount":"500","asset":"USDT","destination":"0xcustomer"}}' | field "['id']")"
+SECOND_ID="$(create '{"idempotency_key":"p3","action":{"type":"payout","amount":"80","asset":"USDT","destination":"0xcustomer"}}' | field "['id']")"
+expect "co-signer keeps its own running total" rejected "$(curl -s "${AUTH[@]}" "$URL/v1/challenges/$SECOND_ID?wait=15" | field "['state']")"
 expect "co-signer vetoes outside its policy" rejected "$(curl -s "${AUTH[@]}" "$URL/v1/challenges/$BIGPAY_ID?wait=15" | field "['state']")"
 
 kill "$SERVER_PID" "$COSIGN_PID"; wait "$SERVER_PID" "$COSIGN_PID" 2>/dev/null || true; SERVER_PID=""; COSIGN_PID=""

@@ -12,7 +12,7 @@ use twof_server::{Config, Error, Service};
 
 const T0: u64 = 1_800_000_000;
 const POLICY: &str = r#"{ "version": 1, "rules": [
-    { "name": "small", "when": { "type": ["withdraw"], "amount_max": "10" }, "then": { "decision": "allow" } },
+    { "name": "small", "when": { "type": ["withdraw"], "asset": ["USDT"], "amount_max": "10" }, "then": { "decision": "allow" } },
     { "name": "ask two", "when": {}, "then": { "decision": "require", "requirements": [ { "count": 2 } ] } } ] }"#;
 const ALLOW_ALL: &str =
     r#"{"version":1,"lists":{},"rules":[{"name":"x","when":{},"then":{"decision":"allow"}}]}"#;
@@ -132,7 +132,7 @@ fn rewriting_the_policy_fails_closed() {
         w.svc
             .create_challenge(
                 &w.project,
-                json!({ "type": "withdraw", "amount": "5" }),
+                json!({ "type": "withdraw", "amount": "5", "asset": "USDT" }),
                 "k0",
                 T0
             )
@@ -361,5 +361,355 @@ fn concurrent_writers_keep_every_guarantee() {
     assert!(
         svc.audit_verify().is_ok(),
         "the audit chain is intact after concurrent writes"
+    );
+}
+
+#[test]
+fn a_planted_approval_row_does_not_count_toward_the_quorum() {
+    let w = world("fake-approval");
+    let ch = w.svc.create_challenge(&w.project, big(), "k1", T0).unwrap();
+    // The attacker controls bob, and writes a row saying alice approved too.
+    w.raw
+        .execute(
+            "INSERT INTO approvals (challenge, approver, credential, kind, sig, created_at) \
+         VALUES (?, 'alice', ?, 'ed25519', ?, 0)",
+            rusqlite::params![ch.id, w.alice.1, twof_core::b64(&[7u8; 64])],
+        )
+        .unwrap();
+    let after = w
+        .svc
+        .submit_approval(&ch.id, &w.bob.1, &sign(&w, &w.bob.0, &ch.id), false, T0)
+        .unwrap();
+    assert_eq!(
+        (after.state.as_str(), after.approvals.len()),
+        ("pending", 1)
+    );
+    assert!(after.receipt.is_none());
+
+    // Alice's real signature on another challenge, moved here, is no better.
+    let other = w
+        .svc
+        .create_challenge(&w.project, json!({ "type": "x" }), "k2", T0)
+        .unwrap();
+    w.raw
+        .execute(
+            "UPDATE approvals SET sig = ? WHERE challenge = ? AND approver = 'alice'",
+            rusqlite::params![sign(&w, &w.alice.0, &other.id), ch.id],
+        )
+        .unwrap();
+    assert_eq!(
+        w.svc
+            .get_challenge(&w.project, &ch.id, T0)
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn weakening_or_reviving_a_challenge_is_refused() {
+    let w = world("challenge-row");
+    let sql = |text: &str, id: &str| w.raw.execute(text, [id]).unwrap();
+    let tampered = |r: Result<twof_server::service::ChallengeView, Error>| matches!(r, Err(Error::Conflict(m)) if m.contains("integrity"));
+
+    // Two people required: rewrite the stored requirement to one.
+    let ch = w.svc.create_challenge(&w.project, big(), "k1", T0).unwrap();
+    sql(
+        r#"UPDATE challenges SET requirements = '[{"count":1,"min_strength":"strong"}]' WHERE id = ?"#,
+        &ch.id,
+    );
+    assert!(tampered(w.svc.submit_approval(
+        &ch.id,
+        &w.bob.1,
+        &twof_core::b64(&[1u8; 64]),
+        false,
+        T0
+    )));
+    assert!(tampered(w.svc.get_challenge(&w.project, &ch.id, T0)));
+    assert!(w.svc.approver_view(&ch.id, T0).is_err());
+
+    // A refused challenge set back to pending.
+    let ch = w.svc.create_challenge(&w.project, big(), "k2", T0).unwrap();
+    let reject = twof_core::b64(
+        &w.alice.0.sign(
+            &w.svc
+                .approver_view(&ch.id, T0)
+                .unwrap()
+                .binding
+                .reject_hash(),
+        ),
+    );
+    assert_eq!(
+        w.svc
+            .submit_approval(&ch.id, &w.alice.1, &reject, true, T0)
+            .unwrap()
+            .state,
+        "rejected"
+    );
+    sql(
+        "UPDATE challenges SET state = 'pending' WHERE id = ?",
+        &ch.id,
+    );
+    assert!(tampered(w.svc.get_challenge(&w.project, &ch.id, T0)));
+
+    // A denied one promoted to allowed.
+    let ch = w
+        .svc
+        .create_challenge(
+            &w.project,
+            json!({ "type": "withdraw", "amount": "5", "asset": "USDT" }),
+            "k3",
+            T0,
+        )
+        .unwrap();
+    assert_eq!(ch.state, "allowed");
+    let denied = w.svc.create_challenge(
+        &w.project,
+        json!({ "type": "withdraw", "amount": "5", "asset": "SCAM" }),
+        "k4",
+        T0,
+    );
+    let denied = denied.unwrap();
+    sql(
+        "UPDATE challenges SET state = 'allowed' WHERE id = ?",
+        &denied.id,
+    );
+    assert!(tampered(w.svc.get_challenge(&w.project, &denied.id, T0)));
+
+    // The deadline pushed forward.
+    let ch = w.svc.create_challenge(&w.project, big(), "k5", T0).unwrap();
+    sql(
+        "UPDATE challenges SET expires_at = expires_at + 999999 WHERE id = ?",
+        &ch.id,
+    );
+    assert!(tampered(w.svc.get_challenge(&w.project, &ch.id, T0)));
+    assert!(
+        audit_broken(&w),
+        "the states in the table no longer match the log"
+    );
+}
+
+#[test]
+fn the_approver_is_never_shown_a_different_action_than_the_one_signed() {
+    let w = world("display");
+    let ch = w.svc.create_challenge(&w.project, big(), "k1", T0).unwrap();
+    // Keep the hash of the dangerous action, show a harmless one.
+    w.raw.execute(
+        r#"UPDATE challenges SET action = '{"amount":"1","asset":"USDT","destination":"0xfriend","type":"withdraw"}' WHERE id = ?"#,
+        [&ch.id],
+    ).unwrap();
+    assert!(matches!(
+        w.svc.approver_view(&ch.id, T0),
+        Err(Error::Conflict(_))
+    ));
+    let sig = twof_core::b64(&[0u8; 64]);
+    assert!(matches!(
+        w.svc.submit_approval(&ch.id, &w.alice.1, &sig, false, T0),
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[test]
+fn a_planted_enrollment_link_does_not_enroll_a_device() {
+    use twof_core::passkey::testing::SoftAuthenticator;
+    use twof_core::passkey::ALG_ES256;
+    let w = world("enrollment");
+    // The attacker invents a link for alice, copying the seal of a real one.
+    let real = w.svc.create_enrollment(&w.project, "alice", T0).unwrap();
+    let token = "attacker-chosen-token";
+    w.raw
+        .execute(
+            "INSERT INTO enrollments (token_hash, project, approver, challenge, expires_at, seal) \
+         SELECT ?, project, approver, challenge, expires_at, seal FROM enrollments",
+            [hex::encode(Sha256::digest(token.as_bytes()))],
+        )
+        .unwrap();
+    assert!(matches!(
+        w.svc.enrollment_view(token, T0),
+        Err(Error::NotFound)
+    ));
+    let view = w.svc.enrollment_view(&real, T0).unwrap();
+    let device = SoftAuthenticator::new();
+    let challenge = twof_core::unb64(&view.challenge).unwrap();
+    let (authenticator_data, client_data_json) =
+        device.register("localhost", "http://localhost:8722", &challenge);
+    let registration = twof_server::Registration {
+        authenticator_data: twof_core::b64(&authenticator_data),
+        client_data_json: twof_core::b64(&client_data_json),
+        public_key: twof_core::b64(&device.public_key_der()),
+        algorithm: ALG_ES256,
+    };
+    assert!(matches!(
+        w.svc.complete_enrollment(token, &registration, T0),
+        Err(Error::NotFound)
+    ));
+    // Stretching the life of a real link is refused as well.
+    w.raw
+        .execute(
+            "UPDATE enrollments SET expires_at = expires_at + 999999",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        w.svc.enrollment_view(&real, T0),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
+fn the_audit_check_notices_history_being_rewritten_in_the_tables() {
+    let allowed = json!({ "type": "withdraw", "amount": "5", "asset": "USDT" });
+
+    // A used receipt made usable again.
+    let w = world("reopen");
+    let token = w
+        .svc
+        .create_challenge(&w.project, allowed.clone(), "k1", T0)
+        .unwrap()
+        .receipt
+        .unwrap();
+    w.svc.consume_receipt(&w.project, &token, T0).unwrap();
+    assert!(w.svc.audit_verify().is_ok());
+    w.raw
+        .execute("UPDATE receipts SET consumed_at = NULL", [])
+        .unwrap();
+    assert!(audit_broken(&w));
+
+    // Past transfers deleted to win back a velocity allowance.
+    let w = world("erase");
+    w.svc
+        .create_challenge(&w.project, allowed.clone(), "k1", T0)
+        .unwrap();
+    assert!(w.svc.audit_verify().is_ok());
+    w.raw.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+    w.raw.execute("DELETE FROM receipts", []).unwrap();
+    w.raw.execute("DELETE FROM challenges", []).unwrap();
+    assert!(audit_broken(&w));
+
+    // A challenge that never went through the server.
+    let w = world("insert");
+    w.svc
+        .create_challenge(&w.project, allowed, "k1", T0)
+        .unwrap();
+    w.raw.execute(
+        "INSERT INTO challenges (id, project, idempotency_key, action, action_hash, state, expires_at, created_at) \
+         SELECT 'ch_planted', project, 'x', action, action_hash, 'allowed', expires_at, created_at FROM challenges",
+        [],
+    ).unwrap();
+    assert!(audit_broken(&w));
+}
+
+#[test]
+fn an_old_version_of_a_row_cannot_be_put_back() {
+    let w = world("rollback");
+    // Two of three must approve. Alice approves, bob sees fraud and refuses.
+    let carol = ServerKey::generate();
+    w.svc
+        .add_approver(&w.project, "carol", "carol", T0)
+        .unwrap();
+    let carol_cred = w
+        .svc
+        .add_credential(
+            &w.project,
+            "carol",
+            ApproverKind::Ed25519,
+            &carol.public_hex(),
+            T0,
+        )
+        .unwrap();
+    let ch = w.svc.create_challenge(&w.project, big(), "k1", T0).unwrap();
+    w.svc
+        .submit_approval(&ch.id, &w.alice.1, &sign(&w, &w.alice.0, &ch.id), false, T0)
+        .unwrap();
+    let carol_sig = sign(&w, &carol, &ch.id);
+    // The attacker saves the row while it is still pending, seal included.
+    let saved: (String, Option<String>) = w
+        .raw
+        .query_row(
+            "SELECT state, seal FROM challenges WHERE id = ?",
+            [&ch.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let reject = twof_core::b64(
+        &w.bob.0.sign(
+            &w.svc
+                .approver_view(&ch.id, T0)
+                .unwrap()
+                .binding
+                .reject_hash(),
+        ),
+    );
+    assert_eq!(
+        w.svc
+            .submit_approval(&ch.id, &w.bob.1, &reject, true, T0)
+            .unwrap()
+            .state,
+        "rejected"
+    );
+
+    // ...and puts it back, hoping carol's approval completes the quorum.
+    w.raw
+        .execute(
+            "UPDATE challenges SET state = ?, seal = ?, decided_at = NULL WHERE id = ?",
+            rusqlite::params![saved.0, saved.1, ch.id],
+        )
+        .unwrap();
+    assert!(matches!(
+        w.svc
+            .submit_approval(&ch.id, &carol_cred, &carol_sig, false, T0),
+        Err(Error::Conflict(_))
+    ));
+    assert!(audit_broken(&w));
+
+    // A used receipt whose mark was erased is still refused.
+    let token = w
+        .svc
+        .create_challenge(
+            &w.project,
+            json!({ "type": "withdraw", "amount": "5", "asset": "USDT" }),
+            "k2",
+            T0,
+        )
+        .unwrap()
+        .receipt
+        .unwrap();
+    w.svc.consume_receipt(&w.project, &token, T0).unwrap();
+    w.raw
+        .execute("UPDATE receipts SET consumed_at = NULL", [])
+        .unwrap();
+    assert!(matches!(
+        w.svc.consume_receipt(&w.project, &token, T0),
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[test]
+fn the_audit_check_notices_an_old_policy_being_restored() {
+    let w = world("policy-rollback");
+    let old: (String, Option<String>) = w
+        .raw
+        .query_row(
+            "SELECT policy, policy_seal FROM projects WHERE id = ?",
+            [&w.project],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    // The owner tightens the rules: everything is refused from now on.
+    w.svc
+        .set_policy(&w.project, r#"{"version":1,"rules":[]}"#, T0)
+        .unwrap();
+    assert!(w.svc.audit_verify().is_ok());
+    // The attacker restores the earlier, looser policy with its genuine seal.
+    w.raw
+        .execute(
+            "UPDATE projects SET policy = ?, policy_seal = ? WHERE id = ?",
+            rusqlite::params![old.0, old.1, w.project],
+        )
+        .unwrap();
+    assert!(
+        audit_broken(&w),
+        "restoring a superseded policy is reported"
     );
 }

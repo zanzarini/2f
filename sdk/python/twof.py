@@ -230,6 +230,10 @@ class TwoF:
         if challenge["state"] not in ("allowed", "approved"):
             return Authorization(False, challenge["state"], None, None, challenge)
         payload = verify_receipt(challenge["receipt"], self.public_keys, action)
+        # A valid receipt for the same action, but from some other request,
+        # is not the answer to this one.
+        if payload.get("challenge") != challenge.get("id"):
+            raise TwoFError("action_mismatch", "receipt belongs to a different challenge")
         return Authorization(True, challenge["state"], challenge["receipt"], payload, challenge)
 
     def consume(self, receipt: str) -> Dict[str, Any]:

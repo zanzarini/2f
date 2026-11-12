@@ -24,7 +24,10 @@ values without floating point numbers.
 ```
 
 `type` is required. `amount`, `asset`, `destination` and `meta` are optional.
-Unknown top level fields are rejected.
+Unknown top level fields are rejected. `amount` is a plain non negative
+decimal without sign, exponent, separators or leading zeros. Control
+characters, invisible characters and text direction overrides are rejected in
+every field.
 
 `action_hash = SHA-256("2F-ACTION-v1\n" || canonical(action))`, hex encoded.
 
@@ -68,8 +71,15 @@ Rules are evaluated in order and the first match decides. No match means
 `velocity` matches when the sum of amounts already authorized for the same
 project and asset in the window, plus this amount, is at most `max_total`.
 
-A requirement is satisfied by `count` distinct approvers whose strength is at
-least `min_strength`, optionally restricted by `kinds` and `approvers`.
+A requirement is satisfied by `count` (1 to 16) distinct approvers whose
+strength is at least `min_strength`, optionally restricted by `kinds` and
+`approvers`. A rule may carry up to 8 requirements, and one approver fills one
+place across all of them: `[{"count":1,"kinds":["passkey"]},{"count":1,"kinds":["cosigner"]}]`
+needs two different approvers.
+
+A policy is refused when a `then` block carries anything its decision does not
+use, or when an `allow` rule looks at amounts (`amount_min`, `amount_max`,
+`velocity`) without an `asset` condition.
 
 ## Receipt
 

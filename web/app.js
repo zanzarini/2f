@@ -19,6 +19,8 @@
       failed: "Something went wrong. Try again.",
       approveHint: "Check the amount and the destination. Your device signs exactly what is shown here.",
       extra: "Notes sent by the requesting system",
+      tampered: "This request failed an integrity check. Nothing can be signed. Tell whoever runs the server.",
+      unusual: "Contains unusual characters. Compare it carefully.",
       enrollHint: "Your device will ask for your fingerprint, face or PIN. The key never leaves it.",
       approver: "Approver",
     },
@@ -37,6 +39,8 @@
       failed: "Algo deu errado. Tente de novo.",
       approveHint: "Confira o valor e o destino. Seu dispositivo assina exatamente o que aparece aqui.",
       extra: "Observações enviadas pelo sistema solicitante",
+      tampered: "Este pedido falhou na conferência de integridade. Nada pode ser assinado. Avise quem cuida do servidor.",
+      unusual: "Contém caracteres incomuns. Compare com cuidado.",
       enrollHint: "Seu dispositivo vai pedir digital, rosto ou PIN. A chave nunca sai dele.",
       approver: "Aprovador",
     },
@@ -98,19 +102,62 @@
   };
   const display = (value) => (typeof value === "string" ? value : JSON.stringify(value));
 
+  // The same canonical form the server and the SDKs use, so this page can
+  // recompute what is about to be signed from what is on screen.
+  const canonical = (value) => {
+    if (value === null || typeof value === "boolean") return String(value);
+    if (typeof value === "string") return JSON.stringify(value);
+    if (typeof value === "number") {
+      if (!Number.isSafeInteger(value)) throw new Error("number");
+      return String(value);
+    }
+    if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
+    const keys = Object.keys(value).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonical(value[k])).join(",") + "}";
+  };
+  const digest = async (tag, text) =>
+    new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(tag + "\n" + text)));
+  const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  // True only when the hashes the device will sign are the hashes of the
+  // action displayed, for this very challenge.
+  const consistent = async (data, id) => {
+    try {
+      const binding = data.binding;
+      if (binding.v !== 1 || binding.challenge !== id || data.id !== id) return false;
+      if (hex(await digest("2F-ACTION-v1", canonical(data.action))) !== binding.action_hash) return false;
+      const text = canonical(binding);
+      return encode(await digest("2F-BINDING-v1", text)) === data.binding_hash
+        && encode(await digest("2F-REJECT-v1", text)) === data.reject_hash;
+    } catch (_) {
+      return false;
+    }
+  };
+  const warnIfUnusual = (element, value) => {
+    if (!/[^\x20-\x7e]/.test(value)) return;
+    const warning = document.createElement("div");
+    warning.className = "warning";
+    warning.textContent = t.unusual;
+    element.parentNode.append(warning);
+  };
+
   async function approvePage(id) {
     $("title").textContent = t.approveTitle;
     const { status, data } = await api("/v1/approvals/" + encodeURIComponent(id));
+    if (status === 409) return finish(t.tampered, "error");
     if (status !== 200) return finish(t.notFound, "error");
     $("project").textContent = data.project_name;
     const action = data.action;
+    const intact = await consistent(data, id);
     row(t.type, action.type);
     if (action.amount !== undefined) {
       row(t.amount, action.amount + (action.asset ? " " + action.asset : ""), "big");
     } else if (action.asset !== undefined) {
       row(t.amount, action.asset, "big");
     }
-    if (action.destination !== undefined) row(t.destination, action.destination, "mono");
+    if (action.asset !== undefined) warnIfUnusual($("details").lastChild.lastChild, action.asset);
+    if (action.destination !== undefined) {
+      warnIfUnusual(row(t.destination, action.destination, "mono"), action.destination);
+    }
     // Free form notes are kept visibly apart from the fields above, so a
     // note named "Destination" cannot pass for the real destination.
     const notes = Object.entries(action.meta || {});
@@ -121,6 +168,7 @@
       $("details").append(heading);
       for (const [key, value] of notes) row(key, display(value), "", true);
     }
+    if (!intact) return finish(t.tampered, "error");
     if (data.state !== "pending") return finish(t.state[data.state] || data.state, "error");
 
     const countdown = row(t.expires, "");
