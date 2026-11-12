@@ -3,13 +3,13 @@
 use crate::error::{Error, Result};
 use crate::limit::Limiter;
 use crate::service::{Proof, Registration, Service};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{middleware, Json, Router};
-use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -201,7 +201,9 @@ async fn authenticate(service: &Shared, headers: &HeaderMap) -> Result<String> {
 }
 
 /// Parses a JSON object body strictly and refuses fields it does not know.
-fn object(body: &str, allowed: &[&str]) -> Result<Map<String, Value>> {
+fn object(body: &Bytes, allowed: &[&str]) -> Result<Map<String, Value>> {
+    let body =
+        std::str::from_utf8(body).map_err(|_| Error::Invalid("body must be UTF-8".into()))?;
     let Value::Object(map) = canonical::parse_strict(body)? else {
         return Err(Error::Invalid("body must be a JSON object".into()));
     };
@@ -241,7 +243,7 @@ async fn enrollment_view(
 async fn complete_enrollment(
     State(service): State<Shared>,
     Path(token): Path<String>,
-    body: String,
+    body: Bytes,
 ) -> Result<Json<Value>> {
     let map = object(
         &body,
@@ -275,7 +277,7 @@ async fn public_keys(State(service): State<Shared>) -> Json<Value> {
 async fn create_challenge(
     State(service): State<Shared>,
     headers: HeaderMap,
-    body: String,
+    body: Bytes,
 ) -> Result<Json<Value>> {
     let project = authenticate(&service, &headers).await?;
     let mut map = object(&body, &["action", "idempotency_key"])?;
@@ -290,20 +292,32 @@ async fn create_challenge(
     Ok(Json(json!(view)))
 }
 
-#[derive(Deserialize)]
-struct WaitQuery {
-    wait: Option<u64>,
+/// Reads `wait=<seconds>` from the query string. Done by hand, after
+/// authentication, so a malformed query tells an anonymous caller nothing.
+fn wait_seconds(query: Option<&str>) -> Result<u64> {
+    let mut wait = 0;
+    for pair in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+        match pair.split_once('=') {
+            Some(("wait", value)) => {
+                wait = value
+                    .parse()
+                    .map_err(|_| Error::Invalid("wait must be a number of seconds".into()))?;
+            }
+            _ => return Err(Error::Invalid("unknown query parameter".into())),
+        }
+    }
+    Ok(wait)
 }
 
 async fn get_challenge(
     State(service): State<Shared>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(query): Query<WaitQuery>,
+    RawQuery(query): RawQuery,
 ) -> Result<Json<Value>> {
     let project = authenticate(&service, &headers).await?;
-    let deadline = tokio::time::Instant::now()
-        + Duration::from_secs(query.wait.unwrap_or(0).min(MAX_WAIT_SECS));
+    let wait = wait_seconds(query.as_deref())?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait.min(MAX_WAIT_SECS));
     let changed = service.changed();
     loop {
         // Register interest before reading, so a change that lands between
@@ -343,7 +357,7 @@ async fn approver_view(
 async fn submit_approval(
     State(service): State<Shared>,
     Path(id): Path<String>,
-    body: String,
+    body: Bytes,
 ) -> Result<Json<Value>> {
     let map = object(&body, &["credential", "signature", "decision", "passkey"])?;
     let proof = match map.get("passkey") {
@@ -392,7 +406,7 @@ async fn submit_approval(
 async fn consume_receipt(
     State(service): State<Shared>,
     headers: HeaderMap,
-    body: String,
+    body: Bytes,
 ) -> Result<Json<Value>> {
     let project = authenticate(&service, &headers).await?;
     let map = object(&body, &["receipt"])?;

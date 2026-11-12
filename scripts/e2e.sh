@@ -99,7 +99,6 @@ url, key, kid, pub = sys.argv[1:]
 client = twof.TwoF(url, key, {kid: pub})
 action = {"type": "withdraw", "amount": "7", "asset": "USDT", "destination": "0xaaa"}
 result = client.authorize(action, "sdk-1")
-client.consume(result.receipt)
 try:
     client.consume(result.receipt)
     print("reused")

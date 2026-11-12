@@ -67,12 +67,13 @@ test("authorize waits, verifies the receipt, and reports refusals", async () => 
   const calls = [];
   const respond = (data, status = 200) => ({ ok: status < 400, status, json: async () => data });
   const script = [
-    respond({ id: "ch_test", state: "pending", approve_url: "http://x/approve/ch_test", receipt: null }),
+    respond({ id: "ch_test", state: "pending", approve_url: "https://x/approve/ch_test", receipt: null }),
     respond({ id: "ch_test", state: "pending", receipt: null }),
     respond({ id: "ch_test", state: "approved", receipt: r.token }),
+    respond({ consumed: true }),
   ];
   const fetchMock = async (url, init) => { calls.push({ url, init }); return script.shift(); };
-  const client = new TwoF({ url: "http://x/", apiKey: "2f_k", publicKeys: keys, fetch: fetchMock });
+  const client = new TwoF({ url: "https://x/", apiKey: "2f_k", publicKeys: keys, fetch: fetchMock });
 
   const realNow = Date.now;
   Date.now = () => r.valid_at * 1000;
@@ -81,10 +82,18 @@ test("authorize waits, verifies the receipt, and reports refusals", async () => 
     const result = await client.authorize(r.action, { idempotencyKey: "k1", onPending: (c) => { seen = c.approve_url; } });
     assert.equal(result.authorized, true);
     assert.equal(result.payload.id, "rc_test");
-    assert.equal(seen, "http://x/approve/ch_test");
-    assert.equal(calls[0].url, "http://x/v1/challenges");
+    assert.equal(seen, "https://x/approve/ch_test");
+    assert.equal(calls[0].url, "https://x/v1/challenges");
     assert.equal(calls[0].init.headers.Authorization, "Bearer 2f_k");
     assert.match(calls[1].url, /\/v1\/challenges\/ch_test\?wait=\d+$/);
+    // Authorizing also marks the receipt as used, and never follows redirects.
+    assert.equal(calls[3].url, "https://x/v1/receipts/consume");
+    assert.equal(calls[3].init.redirect, "error");
+
+    // A retry of something already acted on is refused, not repeated.
+    script.push(respond({ id: "ch_test", state: "approved", receipt: r.token }));
+    script.push(respond({ error: { code: "conflict", message: "receipt was already used" } }, 409));
+    await assert.rejects(client.authorize(r.action, { idempotencyKey: "k1" }), code("conflict"));
 
     // The server returns a receipt for a different action: never authorized.
     script.push(respond({ id: "ch_x", state: "allowed", receipt: r.token }));
@@ -102,4 +111,15 @@ test("authorize waits, verifies the receipt, and reports refusals", async () => 
   } finally {
     Date.now = realNow;
   }
+});
+
+test("the API key is never sent over plain HTTP to another machine", () => {
+  const make = (url, extra = {}) => new TwoF({ url, apiKey: "2f_k", publicKeys: keys, ...extra });
+  assert.throws(() => make("http://2f.example.com"), code("invalid"));
+  assert.throws(() => make("ftp://2f.example.com"), code("invalid"));
+  assert.throws(() => make("http://localhost.evil.io"), code("invalid"));
+  make("https://2f.example.com");
+  make("http://localhost:8722");
+  make("http://127.0.0.1:8722");
+  make("http://2f.internal", { allowInsecure: true });
 });

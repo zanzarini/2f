@@ -24,7 +24,7 @@ if (!result.authorized) {
   process.exit(1);
 }
 
-// The receipt was verified for exactly `action`. Mark it used, then execute.
-await twof.consume(result.receipt);
+// The receipt was verified for exactly `action` and already marked as used:
+// running this script again with the same key is refused instead of repeated.
 console.log("authorized by rule:", result.payload.rule);
 // sendWithdrawal(action) goes here, using the same `action` object.

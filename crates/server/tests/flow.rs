@@ -651,3 +651,53 @@ fn a_leaked_database_cannot_issue_receipts_or_call_the_api() {
     );
     assert!(real.consume_receipt(&project, &forged, T0).is_err());
 }
+
+#[test]
+fn approvers_cannot_be_buried_in_requests() {
+    // Someone holding a stolen API key floods the approvers, hoping one
+    // request gets approved by mistake among many.
+    let config = Config {
+        max_pending: 3,
+        ..Config::default()
+    };
+    let svc = Service::open_in_memory(ServerKey::generate(), config).unwrap();
+    let project = svc.create_project("exchange", T0).unwrap();
+    svc.set_policy(&project, POLICY, T0).unwrap();
+    let ask =
+        |key: &str, now: u64| svc.create_challenge(&project, withdraw("777", "0xnew"), key, now);
+
+    let first = ask("k1", T0).unwrap();
+    assert_eq!(ask("k2", T0).unwrap().state, "pending");
+    assert_eq!(ask("k3", T0).unwrap().state, "pending");
+    assert!(matches!(ask("k4", T0), Err(Error::RateLimited)));
+    assert!(matches!(ask("k5", T0), Err(Error::RateLimited)));
+
+    // Asking again about a request that already exists is not a new request.
+    assert_eq!(ask("k1", T0).unwrap().id, first.id);
+    // What the rules allow or deny on their own is not held back.
+    assert_eq!(
+        svc.create_challenge(&project, withdraw("5", "0xaaa"), "a1", T0)
+            .unwrap()
+            .state,
+        "allowed"
+    );
+    assert_eq!(
+        svc.create_challenge(&project, json!({ "type": "trade" }), "d1", T0)
+            .unwrap()
+            .state,
+        "denied"
+    );
+    // Another project has its own room.
+    let other = svc.create_project("other", T0).unwrap();
+    svc.set_policy(&other, POLICY, T0).unwrap();
+    assert_eq!(
+        svc.create_challenge(&other, withdraw("777", "0xnew"), "k1", T0)
+            .unwrap()
+            .state,
+        "pending"
+    );
+
+    // Once the old ones run out, there is room again.
+    let later = T0 + svc.config.challenge_ttl + 1;
+    assert_eq!(ask("k6", later).unwrap().state, "pending");
+}

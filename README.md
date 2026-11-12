@@ -112,7 +112,6 @@ const result = await twof.authorize(action,
   { idempotencyKey: "withdraw-A-1042" });
 
 if (result.authorized) {
-  await twof.consume(result.receipt);
   await sendWithdrawal(action);
 }
 ```
@@ -133,7 +132,6 @@ result = twof.authorize(
     action, idempotency_key="withdraw-A-1042")
 
 if result.authorized:
-    twof.consume(result.receipt)
     send_withdrawal(action)
 ```
 
@@ -141,8 +139,10 @@ if result.authorized:
 </table>
 
 Both clients verify the receipt locally, against the pinned server key and the
-action you are about to execute. Amounts are always decimal strings, never
-numbers.
+action you are about to execute, and mark it as used before returning: a retry
+with the same idempotency key gets "conflict" instead of a second go-ahead.
+Amounts are always decimal strings, never numbers. The clients refuse plain
+HTTP to anything but the local machine.
 
 ## Rules
 
@@ -169,7 +169,7 @@ A complete example is in [examples/policy.json](examples/policy.json).
 |---|---|
 | `passkey` | fingerprint, face or PIN on a phone or computer, through the built in page |
 | `ed25519` | a device key for command line or app approvers. `twof device approve` shows the action and signs the hash it computes itself |
-| `cosigner` | a second machine with its own key and its own policy (`twof cosign`) |
+| `cosigner` | a second machine with its own key, its own policy and its own running total (`twof cosign`). It counts only where a rule names it |
 | Telegram | a message with the approval link. It notifies; it never approves |
 | Webhooks | `challenge.pending`, `approved`, `rejected`, `expired`, signed with the server key |
 

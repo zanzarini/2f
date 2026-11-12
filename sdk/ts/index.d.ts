@@ -56,12 +56,12 @@ export function verifyReceipt(token: string, publicKeys: Record<string, string>,
 export function pinnedApprovers(payload: ReceiptPayload, pinned: Record<string, string>): string[];
 
 export class TwoF {
-  constructor(options: { url: string; apiKey: string; publicKeys: Record<string, string>; fetch?: typeof fetch });
+  constructor(options: { url: string; apiKey: string; publicKeys: Record<string, string>; fetch?: typeof fetch; allowInsecure?: boolean });
   createChallenge(action: Action, idempotencyKey: string): Promise<Challenge>;
   getChallenge(id: string, waitSeconds?: number): Promise<Challenge>;
   authorize(
     action: Action,
-    options: { idempotencyKey: string; timeoutSeconds?: number; onPending?: (challenge: Challenge) => void | Promise<void> },
+    options: { idempotencyKey: string; timeoutSeconds?: number; consume?: boolean; onPending?: (challenge: Challenge) => void | Promise<void> },
   ): Promise<Authorization>;
   consume(receipt: string): Promise<{ consumed: true; receipt: ReceiptPayload }>;
 }

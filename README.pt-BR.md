@@ -113,7 +113,7 @@ Exemplo completo em [examples/policy.json](examples/policy.json).
 |---|---|
 | `passkey` | digital, rosto ou PIN no celular ou computador, pela página embutida |
 | `ed25519` | chave de dispositivo para aprovar por linha de comando ou aplicativo. `twof device approve` mostra a ação e assina o hash que ele mesmo calcula |
-| `cosigner` | uma segunda máquina, com chave e regras próprias (`twof cosign`) |
+| `cosigner` | uma segunda máquina, com chave, regras e total acumulado próprios (`twof cosign`). Só conta onde a regra pede por ela |
 | Telegram | mensagem com o link de aprovação. Avisa, nunca aprova |
 | Webhooks | eventos assinados com a chave do servidor |
 

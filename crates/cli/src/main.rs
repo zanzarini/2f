@@ -55,6 +55,9 @@ enum Command {
         /// Read the client address from X-Forwarded-For. Only behind your own reverse proxy.
         #[arg(long, env = "TWOF_TRUST_PROXY")]
         trust_proxy: bool,
+        /// Most approvals a project may have waiting at once.
+        #[arg(long, env = "TWOF_MAX_PENDING", default_value_t = 20)]
+        max_pending: u32,
         /// Create the database (and the key, if none is configured) when missing.
         #[arg(long, env = "TWOF_AUTO_INIT")]
         auto_init: bool,
@@ -316,6 +319,7 @@ fn run(cli: Cli) -> AnyResult<()> {
             receipt_ttl,
             rate_per_minute,
             trust_proxy,
+            max_pending,
             auto_init,
         } => {
             let config = Config {
@@ -324,6 +328,7 @@ fn run(cli: Cli) -> AnyResult<()> {
                 public_url: public_url.clone(),
                 rate_per_minute: *rate_per_minute,
                 trust_proxy: *trust_proxy,
+                max_pending: *max_pending,
             };
             if *auto_init && !cli.db.exists() {
                 let from_env = std::env::var("TWOF_KEY").is_ok_and(|k| !k.trim().is_empty());

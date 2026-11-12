@@ -68,10 +68,11 @@ class Vectors(unittest.TestCase):
         self.assertEqual(pinned_approvers(moved, {R["approver"]: R["approver_public_key"]}), [])
 
     def test_authorize_verifies_the_receipt(self):
-        client = twof.TwoF("http://x/", "2f_k", KEYS)
+        client = twof.TwoF("https://x/", "2f_k", KEYS)
         script = [
-            {"id": "ch_test", "state": "pending", "approve_url": "http://x/approve/ch_test", "receipt": None},
+            {"id": "ch_test", "state": "pending", "approve_url": "https://x/approve/ch_test", "receipt": None},
             {"id": "ch_test", "state": "approved", "receipt": R["token"]},
+            {"consumed": True},
         ]
         calls = []
         client._request = lambda method, path, body=None: (calls.append((method, path)), script.pop(0))[1]
@@ -81,9 +82,10 @@ class Vectors(unittest.TestCase):
             seen = []
             result = client.authorize(R["action"], "k1", on_pending=lambda c: seen.append(c["approve_url"]))
             self.assertTrue(result.authorized)
-            self.assertEqual(seen, ["http://x/approve/ch_test"])
+            self.assertEqual(seen, ["https://x/approve/ch_test"])
             self.assertEqual(calls[0], ("POST", "/v1/challenges"))
             self.assertTrue(calls[1][1].startswith("/v1/challenges/ch_test?wait="))
+            self.assertEqual(calls[2], ("POST", "/v1/receipts/consume"))
 
             script.append({"id": "ch_x", "state": "allowed", "receipt": R["token"]})
             self.assert_code("action_mismatch", client.authorize, R["other_action"], "k2")
@@ -93,6 +95,19 @@ class Vectors(unittest.TestCase):
             self.assertFalse(client.authorize(R["action"], "k3").authorized)
         finally:
             twof.time.time = real_time
+
+
+    def test_api_key_is_never_sent_over_plain_http_to_another_machine(self):
+        for bad in ["http://2f.example.com", "ftp://2f.example.com", "http://localhost.evil.io"]:
+            self.assert_code("invalid", twof.TwoF, bad, "2f_k", KEYS)
+        twof.TwoF("https://2f.example.com", "2f_k", KEYS)
+        twof.TwoF("http://localhost:8722", "2f_k", KEYS)
+        twof.TwoF("http://127.0.0.1:8722", "2f_k", KEYS)
+        twof.TwoF("http://2f.internal", "2f_k", KEYS, allow_insecure=True)
+
+    def test_redirects_are_not_followed(self):
+        handler = twof._NoRedirect()
+        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "https://evil.example"))
 
 
 if __name__ == "__main__":

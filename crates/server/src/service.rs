@@ -31,7 +31,7 @@ use twof_core::{
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, policy TEXT NOT NULL, policy_seal TEXT,
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, name_seal TEXT, policy TEXT NOT NULL, policy_seal TEXT,
     created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS api_keys (
     id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(id), hash TEXT NOT NULL UNIQUE,
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS approvers (
     created_at INTEGER NOT NULL, disabled_at INTEGER, PRIMARY KEY (project, id));
 CREATE TABLE IF NOT EXISTS credentials (
     id TEXT PRIMARY KEY, project TEXT NOT NULL, approver TEXT NOT NULL, kind TEXT NOT NULL,
-    public_key TEXT NOT NULL, external_id TEXT UNIQUE, counter INTEGER NOT NULL DEFAULT 0,
+    public_key TEXT NOT NULL, external_id TEXT, counter INTEGER NOT NULL DEFAULT 0,
     seal TEXT, created_at INTEGER NOT NULL, revoked_at INTEGER,
     FOREIGN KEY (project, approver) REFERENCES approvers(project, id));
 CREATE TABLE IF NOT EXISTS enrollments (
@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS challenges (
     expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, decided_at INTEGER, receipt TEXT,
     seal TEXT, UNIQUE (project, idempotency_key));
 CREATE INDEX IF NOT EXISTS challenges_velocity ON challenges (project, asset, decided_at);
+CREATE INDEX IF NOT EXISTS challenges_pending ON challenges (project, expires_at) WHERE state = 'pending';
+CREATE UNIQUE INDEX IF NOT EXISTS credentials_external ON credentials (project, external_id)
+    WHERE external_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS approvals (
     challenge TEXT NOT NULL REFERENCES challenges(id), approver TEXT NOT NULL,
     credential TEXT NOT NULL, kind TEXT NOT NULL, sig TEXT NOT NULL, created_at INTEGER NOT NULL,
@@ -96,6 +99,9 @@ pub struct Config {
     /// Take the client address from the last `X-Forwarded-For` entry. Only
     /// enable behind a reverse proxy that sets that header itself.
     pub trust_proxy: bool,
+    /// Most approvals a project may have waiting at once. A stolen API key
+    /// cannot bury approvers in requests until one is approved by mistake.
+    pub max_pending: u32,
 }
 
 impl Default for Config {
@@ -106,6 +112,7 @@ impl Default for Config {
             public_url: "http://localhost:8722".into(),
             rate_per_minute: 600,
             trust_proxy: false,
+            max_pending: 20,
         }
     }
 }
@@ -323,6 +330,10 @@ fn approver_active(conn: &Connection, project: &str, approver: &str) -> Result<(
     .ok_or(Error::NotFound)
 }
 
+fn name_fields(project: &str, name: &str) -> Value {
+    json!({ "t": "project", "id": project, "name": name })
+}
+
 fn policy_fields(project: &str, policy: &str) -> Value {
     json!({ "t": "policy", "project": project, "policy": policy })
 }
@@ -532,6 +543,23 @@ impl Inner {
         Ok(out)
     }
 
+    /// The name shown to approvers. If someone edited it in the table (to
+    /// make a real request look like a test, say), the plain id is shown.
+    fn project_name(&self, conn: &Connection, project: &str) -> Result<String> {
+        let (name, seal) = one(
+            conn,
+            "SELECT name, name_seal FROM projects WHERE id = ?",
+            [project],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )?
+        .ok_or(Error::NotFound)?;
+        if self.sealed(&name_fields(project, &name), seal.as_deref()) {
+            Ok(name)
+        } else {
+            Ok(project.to_owned())
+        }
+    }
+
     fn approve_url(&self, challenge: &str) -> String {
         format!(
             "{}/approve/{challenge}",
@@ -653,13 +681,7 @@ impl Inner {
 
     fn approver_view(&self, conn: &Connection, row: ChallengeRow) -> Result<ApproverView> {
         self.intact(&row)?;
-        let project_name = one(
-            conn,
-            "SELECT name FROM projects WHERE id = ?",
-            [&row.project],
-            |r| r.get(0),
-        )?
-        .ok_or(Error::NotFound)?;
+        let project_name = self.project_name(conn, &row.project)?;
         let binding = row.binding();
         Ok(ApproverView {
             id: row.id.clone(),
@@ -1055,10 +1077,23 @@ impl Service {
             let policy = serde_json::to_string(&Policy::deny_all()).map_err(internal)?;
             exec(
                 conn,
-                "INSERT INTO projects (id, name, policy, policy_seal, created_at) VALUES (?, ?, ?, ?, ?)",
-                params![id, name, policy, inner.seal(&policy_fields(&id, &policy)), now as i64],
+                "INSERT INTO projects (id, name, name_seal, policy, policy_seal, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    id,
+                    name,
+                    inner.seal(&name_fields(&id, &name)),
+                    policy,
+                    inner.seal(&policy_fields(&id, &policy)),
+                    now as i64
+                ],
             )?;
-            inner.audit(conn, now, "project.created", json!({ "project": id, "name": name }))?;
+            inner.audit(
+                conn,
+                now,
+                "project.created",
+                json!({ "project": id, "name": name }),
+            )?;
             Ok(id)
         })
     }
@@ -1323,13 +1358,7 @@ impl Service {
         self.store.read(move |conn| {
             let (project, approver, challenge, expires_at) =
                 inner.open_enrollment(conn, &token, now)?;
-            let project_name = one(
-                conn,
-                "SELECT name FROM projects WHERE id = ?",
-                [&project],
-                |r| r.get(0),
-            )?
-            .ok_or(Error::NotFound)?;
+            let project_name = inner.project_name(conn, &project)?;
             let approver_name = one(
                 conn,
                 "SELECT name FROM approvers WHERE project = ? AND id = ? AND disabled_at IS NULL",
@@ -1478,6 +1507,18 @@ impl Service {
 
             let policy = inner.policy(conn, &project)?;
             let decision = policy.evaluate(&action, &VelocityCtx { conn, project: &project, now });
+            if matches!(decision.outcome, Outcome::Require { .. }) {
+                let waiting = one(
+                    conn,
+                    "SELECT COUNT(*) FROM challenges WHERE project = ? AND state = 'pending' AND expires_at >= ?",
+                    params![project, now as i64],
+                    |r| r.get::<_, i64>(0),
+                )?
+                .unwrap_or(0);
+                if waiting >= i64::from(inner.config.max_pending) {
+                    return Err(Error::RateLimited);
+                }
+            }
             let (state, requirements) = match &decision.outcome {
                 Outcome::Allow => ("allowed", None),
                 Outcome::Deny => ("denied", None),

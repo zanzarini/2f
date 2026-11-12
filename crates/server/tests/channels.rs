@@ -409,3 +409,50 @@ fn notifications_planted_in_the_database_are_not_sent_in_the_servers_name() {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }
+
+#[test]
+fn a_machine_is_not_one_approver() {
+    let w = world();
+    // "One approver", with no kind named, means a person.
+    w.svc
+        .set_policy(
+            &w.project,
+            r#"{"version":1,"rules":[{"name":"one person","when":{},"then":{"decision":"require","requirements":[{"count":1}]}}]}"#,
+            T0,
+        )
+        .unwrap();
+    let ch = w
+        .svc
+        .create_challenge(&w.project, withdraw("100", "USDT", "0xaaa"), "k1", T0)
+        .unwrap();
+    let binding = w.svc.approver_view(&ch.id, T0).unwrap().binding;
+    let approve = twof_core::b64(&w.vault.key.sign(&binding.hash()));
+    let veto = twof_core::b64(&w.vault.key.sign(&binding.reject_hash()));
+    // The co-signer can neither satisfy the rule nor veto a request that
+    // never asked for it.
+    assert!(matches!(
+        w.svc
+            .submit_approval(&ch.id, &w.vault.credential, &approve, false, T0),
+        Err(Error::Forbidden(_))
+    ));
+    assert!(matches!(
+        w.svc
+            .submit_approval(&ch.id, &w.vault.credential, &veto, true, T0),
+        Err(Error::Forbidden(_))
+    ));
+    assert_eq!(
+        w.svc.get_challenge(&w.project, &ch.id, T0).unwrap().state,
+        "pending"
+    );
+    let done = w
+        .svc
+        .submit_approval(
+            &ch.id,
+            &w.alice.1,
+            &twof_core::b64(&w.alice.0.sign(&binding.hash())),
+            false,
+            T0,
+        )
+        .unwrap();
+    assert_eq!(done.state, "approved");
+}

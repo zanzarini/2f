@@ -20,13 +20,15 @@ of the table has tests behind it; the file is named in the last column.
 
 | Scenario | What the attacker can do | What still holds | Tests |
 |---|---|---|---|
-| Stolen client API key | Create challenges and read their status | Cannot approve. Anything outside the auto-allow rules still needs an approver signature. Damage is bounded by the policy limits and velocity caps. | `flow.rs` |
+| Stolen client API key | Create challenges and read their status | Cannot approve. Anything outside the auto-allow rules still needs an approver signature. Damage is bounded by the policy limits and velocity caps. Approvers cannot be buried in requests until one slips through: a project has a small limit of approvals waiting at once (`--max-pending`, 20 by default). | `flow.rs` |
+| A careless or hostile network path to the server | Read or redirect what the client sends | The SDKs refuse plain HTTP except to the local machine, so the API key is not sent in the clear, and they do not follow redirects, which would carry the key elsewhere. | SDK tests |
+| The same authorization acted on twice | Retry after a crash, or replay a response | `authorize` in the SDKs marks the receipt as used before returning. A second attempt with the same idempotency key gets "conflict" instead of a second go-ahead. | SDK tests, `flow.rs` |
 | Database copy leaked (read) | Read public keys, API key hashes, history | Cannot approve (no private keys), cannot call the API (hashes only), cannot issue receipts (the signing key is not there). | `flow.rs` |
 | Database write access | Insert, edit or delete rows | Cannot grant themselves power. Credentials, API keys, policies, enrollment links, notification settings and every challenge (its state, requirements and deadline) are sealed with the server key; a row without a valid seal is ignored or refused, and an edited policy fails closed to "deny everything". A planted approval does not count: each stored signature is verified again when the quorum is counted. The approver is never shown an action other than the one whose hash is signed. A decided challenge or a used receipt cannot be put back while the server runs. Notifications planted or redirected in the queue are not sent. The audit log cannot be extended (every entry is signed), and `twof audit verify` reports rows that no longer match it: grants, policies, challenge states, used receipts. | `tamper.rs`, `channels.rs` |
 | Network attacker or tampering client | Replay or alter requests | Receipts bind the hash of the canonical action; changing amount or destination invalidates them. Receipts expire in minutes and are consumed once. Approvals are bound to one challenge. | `flow.rs`, core |
 | Phishing an approver | Show a fake page | Passkeys are bound to the real origin, so a look-alike site cannot obtain a usable signature. The signature covers the action hash, so approving A cannot be reused for B. | `passkey.rs` |
 | Misleading the approver's screen | Send text that displays as something else | Invisible and text reordering characters are rejected in every field shown. Free form notes are displayed apart from amount and destination. | core `action` |
-| Stolen approver device, or a rogue approver | Approve as that person | Rules can require several distinct people or an independent co-signer. One person fills one place: someone holding two kinds of credential does not satisfy "a person and the vault" alone. Disabling an approver revokes their credentials and their approvals on pending challenges stop counting. | `tamper.rs`, core `policy` |
+| Stolen approver device, or a rogue approver | Approve as that person | Rules can require several distinct people or an independent co-signer. One person fills one place: someone holding two kinds of credential does not satisfy "a person and the vault" alone. A co-signer machine never counts as "one approver": it fills, and can veto, only requirements that name it. Disabling an approver revokes their credentials and their approvals on pending challenges stop counting. | `tamper.rs`, core `policy` |
 | A policy written carelessly | Rely on a rule that allows more than intended | Policies are refused when they contain an unknown field, an outcome with parts that do not belong to it (`allow` with `requirements`), or an `allow` rule that limits amounts without naming the asset. | core `policy` |
 | Cloned passkey | Use a copy of an authenticator | A signature counter that fails to grow is refused. | `passkey.rs` |
 | Weak channel compromised (Telegram account) | Read notifications | Telegram only carries the link. It never approves. | `channels.rs` |
@@ -83,8 +85,13 @@ Stated plainly so nobody relies on something that is not there.
   before the person confirms is outside what a server can prevent.
 - **A client that skips verification.** The receipt only protects a client
   that checks it before executing.
-- **Denial of service** is limited to per address rate limiting. Put the
-  server behind a proxy that does more if you need it.
+- **Denial of service** is limited to per address rate limiting and the
+  limit of waiting approvals. Slow or stalled connections are not timed out by
+  2F itself: run it behind a reverse proxy, which is needed for HTTPS anyway.
+- **Rules match exactly.** `"usdt"` is not `"USDT"`, and an address in another
+  letter case is another address. Write rules that allow what you know and
+  send everything else to a person, rather than rules that deny what you
+  fear: a deny rule is only as good as its spelling.
 - **Real device coverage.** Passkey verification is tested against a software
   authenticator that follows the WebAuthn specification, not yet against a
   matrix of real phones and browsers.

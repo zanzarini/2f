@@ -118,8 +118,14 @@ export class TwoF {
    * `publicKeys` comes from `twof pubkey` on the server. Pin it in your
    * configuration; do not fetch it from the server at runtime.
    */
-  constructor({ url, apiKey, publicKeys, fetch: fetchImpl }) {
+  constructor({ url, apiKey, publicKeys, fetch: fetchImpl, allowInsecure = false }) {
     if (!url || !apiKey || !publicKeys) throw new TwoFError("invalid", "url, apiKey and publicKeys are required");
+    // The API key travels in every request: never over plain HTTP, except to this machine.
+    const { protocol, hostname } = new URL(url);
+    const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+    if (protocol !== "https:" && !(protocol === "http:" && (local || allowInsecure))) {
+      throw new TwoFError("invalid", "url must be https (http is only accepted for localhost)");
+    }
     this.url = url.replace(/\/+$/, "");
     this.apiKey = apiKey;
     this.publicKeys = publicKeys;
@@ -129,6 +135,8 @@ export class TwoF {
   async request(method, path, body) {
     const response = await this.fetch(this.url + path, {
       method,
+      // A redirect would carry the API key to wherever it points.
+      redirect: "error",
       headers: { Authorization: "Bearer " + this.apiKey, ...(body ? { "Content-Type": "application/json" } : {}) },
       body: body ? canonical(body) : undefined,
     });
@@ -153,10 +161,13 @@ export class TwoF {
   /**
    * Asks for authorization and waits for the outcome.
    * Resolves to `{ authorized, state, receipt, payload, challenge }`.
-   * When `authorized` is true the receipt was verified for exactly `action`.
+   * When `authorized` is true the receipt was verified for exactly `action`
+   * and marked as used on the server, so the same authorization cannot be
+   * acted on twice: a retry with the same idempotency key throws "conflict".
+   * Pass `consume: false` to mark it yourself later with `consume()`.
    * `onPending` is called once with the challenge (it carries `approve_url`).
    */
-  async authorize(action, { idempotencyKey, timeoutSeconds = 300, onPending } = {}) {
+  async authorize(action, { idempotencyKey, timeoutSeconds = 300, onPending, consume = true } = {}) {
     if (!idempotencyKey) throw new TwoFError("invalid", "idempotencyKey is required");
     let challenge = await this.createChallenge(action, idempotencyKey);
     if (challenge.state === "pending" && onPending) await onPending(challenge);
@@ -174,6 +185,7 @@ export class TwoF {
     if (payload.challenge !== challenge.id) {
       throw new TwoFError("action_mismatch", "receipt belongs to a different challenge");
     }
+    if (consume) await this.consume(challenge.receipt);
     return { authorized: true, state: challenge.state, receipt: challenge.receipt, payload, challenge };
   }
 

@@ -75,7 +75,12 @@ A requirement is satisfied by `count` (1 to 16) distinct approvers whose
 strength is at least `min_strength`, optionally restricted by `kinds` and
 `approvers`. A rule may carry up to 8 requirements, and one approver fills one
 place across all of them: `[{"count":1,"kinds":["passkey"]},{"count":1,"kinds":["cosigner"]}]`
-needs two different approvers.
+needs two different approvers. A `cosigner` is counted only by a requirement
+whose `kinds` lists it; a requirement without `kinds` means people.
+
+A project may have a limited number of challenges waiting for approval at once
+(20 by default). Beyond it, `POST /v1/challenges` answers `429` for actions
+that would need approval; actions the rules allow or deny are unaffected.
 
 A policy is refused when a `then` block carries anything its decision does not
 use, or when an `allow` rule looks at amounts (`amount_min`, `amount_max`,

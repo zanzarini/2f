@@ -358,12 +358,16 @@ pub struct ApprovalFact {
 }
 
 impl Requirement {
+    /// A co-signer is a machine that approves on its own. It only fills a
+    /// place that asks for it by name: "one approver" means a person, and
+    /// must not be satisfied by an automatic signature.
     pub fn accepts(&self, fact: &ApprovalFact) -> bool {
+        let kind_fits = match &self.kinds {
+            Some(kinds) => kinds.contains(&fact.kind),
+            None => fact.kind != ApproverKind::Cosigner,
+        };
         fact.kind.strength() >= self.min_strength
-            && self
-                .kinds
-                .as_ref()
-                .is_none_or(|kinds| kinds.contains(&fact.kind))
+            && kind_fits
             && self
                 .approvers
                 .as_ref()
@@ -702,6 +706,26 @@ mod tests {
         assert!(!default.satisfied(&[fact("alice", ApproverKind::Totp)]));
         let weak_ok = req(r#"{"count":1,"min_strength":"weak"}"#);
         assert!(weak_ok.satisfied(&[fact("alice", ApproverKind::Telegram)]));
+    }
+
+    #[test]
+    fn a_cosigner_only_counts_where_it_is_named() {
+        let anyone = req(r#"{"count":1}"#);
+        assert!(anyone.satisfied(&[fact("alice", ApproverKind::Passkey)]));
+        assert!(anyone.satisfied(&[fact("alice", ApproverKind::Ed25519)]));
+        // A machine that approves automatically is not "one approver".
+        assert!(!anyone.satisfied(&[fact("vault", ApproverKind::Cosigner)]));
+        assert!(!all_satisfied(
+            &[req(r#"{"count":2}"#)],
+            &[
+                fact("alice", ApproverKind::Passkey),
+                fact("vault", ApproverKind::Cosigner)
+            ]
+        ));
+        let named = req(r#"{"count":1,"kinds":["cosigner"]}"#);
+        assert!(named.satisfied(&[fact("vault", ApproverKind::Cosigner)]));
+        let either = req(r#"{"count":1,"kinds":["passkey","cosigner"]}"#);
+        assert!(either.satisfied(&[fact("vault", ApproverKind::Cosigner)]));
     }
 
     #[test]

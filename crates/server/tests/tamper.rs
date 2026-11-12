@@ -312,7 +312,9 @@ fn concurrent_writers_keep_every_guarantee() {
         std::thread::spawn(move || {
             (0..5).filter(|i| {
                 let action = json!({ "type": "withdraw", "amount": "10", "asset": "USDT", "destination": "0xaaa" });
-                svc.create_challenge(&project, action, &format!("v-{t}-{i}"), T0).unwrap().state == "allowed"
+                // Past the cap the rest wait for a person, and past the limit of
+                // waiting requests they are turned away; neither is "allowed".
+                svc.create_challenge(&project, action, &format!("v-{t}-{i}"), T0).is_ok_and(|c| c.state == "allowed")
             }).count()
         })
     }).collect();
@@ -349,7 +351,8 @@ fn concurrent_writers_keep_every_guarantee() {
         .map(|_| {
             let (svc, project) = (svc.clone(), project.clone());
             std::thread::spawn(move || {
-                svc.create_challenge(&project, json!({ "type": "x" }), "same", T0)
+                // Later in time, when the requests left waiting above have run out.
+                svc.create_challenge(&project, json!({ "type": "x" }), "same", T0 + 7200)
                     .unwrap()
                     .id
             })
@@ -711,5 +714,87 @@ fn the_audit_check_notices_an_old_policy_being_restored() {
     assert!(
         audit_broken(&w),
         "restoring a superseded policy is reported"
+    );
+}
+
+#[test]
+fn a_renamed_project_is_shown_by_its_id() {
+    let w = world("rename");
+    let ch = w.svc.create_challenge(&w.project, big(), "k1", T0).unwrap();
+    assert_eq!(
+        w.svc.approver_view(&ch.id, T0).unwrap().project_name,
+        "exchange"
+    );
+    // Make a real request look like a drill.
+    w.raw
+        .execute(
+            "UPDATE projects SET name = 'TEST ONLY - nothing here is real'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        w.svc.approver_view(&ch.id, T0).unwrap().project_name,
+        w.project
+    );
+}
+
+#[test]
+fn the_same_passkey_id_in_another_project_changes_nothing() {
+    use twof_core::passkey::testing::SoftAuthenticator;
+    use twof_core::passkey::ALG_ES256;
+    let w = world("external-id");
+    let other = w.svc.create_project("other", T0).unwrap();
+    w.svc
+        .add_approver(&other, "mallory", "mallory", T0)
+        .unwrap();
+    let enroll = |project: &str, approver: &str, device: &SoftAuthenticator| {
+        let token = w.svc.create_enrollment(project, approver, T0).unwrap();
+        let view = w.svc.enrollment_view(&token, T0).unwrap();
+        let challenge = twof_core::unb64(&view.challenge).unwrap();
+        let (authenticator_data, client_data_json) =
+            device.register("localhost", "http://localhost:8722", &challenge);
+        w.svc.complete_enrollment(
+            &token,
+            &twof_server::Registration {
+                authenticator_data: twof_core::b64(&authenticator_data),
+                client_data_json: twof_core::b64(&client_data_json),
+                public_key: twof_core::b64(&device.public_key_der()),
+                algorithm: ALG_ES256,
+            },
+            T0,
+        )
+    };
+    // Mallory, an approver elsewhere, registers a device that claims the
+    // same credential id alice's device is about to use.
+    let alice_device = SoftAuthenticator::new();
+    let mut squatter = SoftAuthenticator::new();
+    squatter.credential_id = alice_device.credential_id.clone();
+    assert!(enroll(&other, "mallory", &squatter).is_ok());
+    // Alice can still register, and the same device twice is still refused.
+    assert!(enroll(&w.project, "alice", &alice_device).is_ok());
+    assert!(matches!(
+        enroll(&w.project, "alice", &alice_device),
+        Err(Error::Conflict(_))
+    ));
+
+    // Mallory's device cannot approve in alice's project under that id.
+    w.svc.set_policy(&w.project, r#"{"version":1,"rules":[{"name":"p","when":{},"then":{"decision":"require","requirements":[{"count":1,"kinds":["passkey"]}]}}]}"#, T0).unwrap();
+    let ch = w.svc.create_challenge(&w.project, big(), "k1", T0).unwrap();
+    let hash = twof_core::unb64(&w.svc.approver_view(&ch.id, T0).unwrap().binding_hash).unwrap();
+    let proof = |device: &mut SoftAuthenticator| twof_server::Proof::Passkey {
+        credential_id: twof_core::b64(&device.credential_id),
+        assertion: device.assert("localhost", "http://localhost:8722", &hash),
+    };
+    assert!(matches!(
+        w.svc.submit(&ch.id, &proof(&mut squatter), false, T0),
+        Err(Error::Forbidden(_))
+    ));
+    let mut alice_device = alice_device;
+    assert_eq!(
+        w.svc
+            .submit(&ch.id, &proof(&mut alice_device), false, T0)
+            .unwrap()
+            .state,
+        "approved"
     );
 }

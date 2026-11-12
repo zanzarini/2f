@@ -226,3 +226,44 @@ async fn clients_are_rate_limited_by_address() {
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn nothing_about_the_request_is_examined_before_the_api_key() {
+    let app = app(Config::default());
+    // A malformed query or body from an anonymous caller is just "unauthorized".
+    for path in ["/v1/challenges/ch_x?wait=abc", "/v1/challenges/ch_x?nope=1"] {
+        assert_eq!(
+            send(&app, get(path, None)).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(&app, get(path, Some("2f_wrong"))).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(&app, get(path, Some(&app.key))).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let binary = || Body::from(vec![0xff, 0xfe, 0x00]);
+    let anonymous = Request::post("/v1/challenges").body(binary()).unwrap();
+    assert_eq!(send(&app, anonymous).await.0, StatusCode::UNAUTHORIZED);
+    let known = Request::post("/v1/challenges")
+        .header("authorization", format!("Bearer {}", app.key))
+        .body(binary())
+        .unwrap();
+    assert_eq!(send(&app, known).await.0, StatusCode::BAD_REQUEST);
+
+    // A valid wait still works and is capped.
+    let (_, _, created) = send(&app, post("/v1/challenges", Some(&app.key), CREATE)).await;
+    let id = created["id"].as_str().unwrap();
+    let (status, _, view) = send(
+        &app,
+        get(&format!("/v1/challenges/{id}?wait=0"), Some(&app.key)),
+    )
+    .await;
+    assert_eq!(
+        (status, view["state"].as_str()),
+        (StatusCode::OK, Some("pending"))
+    );
+}

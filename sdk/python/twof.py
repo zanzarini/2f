@@ -6,7 +6,6 @@ Single module. Needs the `cryptography` package for Ed25519 verification.
     result = client.authorize(action, idempotency_key="order-991")
     if result.authorized:
         execute(action)
-        client.consume(result.receipt)
 """
 
 from __future__ import annotations
@@ -168,6 +167,11 @@ def pinned_approvers(payload: Dict[str, Any], pinned: Dict[str, str]) -> List[st
     return names
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 @dataclass
 class Authorization:
     authorized: bool
@@ -181,9 +185,17 @@ class TwoF:
     """Talks to a 2F server. Pin `public_keys` in your configuration; do not
     fetch them from the server at runtime."""
 
-    def __init__(self, url: str, api_key: str, public_keys: Dict[str, str], timeout: float = 40.0):
+    def __init__(self, url: str, api_key: str, public_keys: Dict[str, str], timeout: float = 40.0,
+                 allow_insecure: bool = False):
         if not url or not api_key or not public_keys:
             raise TwoFError("invalid", "url, api_key and public_keys are required")
+        # The API key travels in every request: never over plain HTTP, except to this machine.
+        parts = urllib.parse.urlsplit(url)
+        local = parts.hostname in ("localhost", "127.0.0.1", "::1")
+        if parts.scheme != "https" and not (parts.scheme == "http" and (local or allow_insecure)):
+            raise TwoFError("invalid", "url must be https (http is only accepted for localhost)")
+        # A redirect would carry the API key to wherever it points.
+        self._opener = urllib.request.build_opener(_NoRedirect)
         self.url = url.rstrip("/")
         self.api_key = api_key
         self.public_keys = public_keys
@@ -196,7 +208,7 @@ class TwoF:
         if data is not None:
             request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             try:
@@ -214,10 +226,14 @@ class TwoF:
         return self._request("GET", path + ("?wait=%d" % wait_seconds if wait_seconds else ""))
 
     def authorize(self, action: Dict[str, Any], idempotency_key: str, timeout_seconds: int = 300,
-                  on_pending: Optional[Callable[[Dict[str, Any]], None]] = None) -> Authorization:
+                  on_pending: Optional[Callable[[Dict[str, Any]], None]] = None,
+                  consume: bool = True) -> Authorization:
         """Asks for authorization and waits for the outcome.
 
-        When `authorized` is true the receipt was verified for exactly `action`.
+        When `authorized` is true the receipt was verified for exactly `action`
+        and marked as used on the server, so the same authorization cannot be
+        acted on twice: a retry with the same idempotency key raises "conflict".
+        Pass `consume=False` to mark it yourself later with `consume()`.
         `on_pending` is called once with the challenge (it carries `approve_url`).
         """
         challenge = self.create_challenge(action, idempotency_key)
@@ -234,6 +250,8 @@ class TwoF:
         # is not the answer to this one.
         if payload.get("challenge") != challenge.get("id"):
             raise TwoFError("action_mismatch", "receipt belongs to a different challenge")
+        if consume:
+            self.consume(challenge["receipt"])
         return Authorization(True, challenge["state"], challenge["receipt"], payload, challenge)
 
     def consume(self, receipt: str) -> Dict[str, Any]:
