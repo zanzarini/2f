@@ -382,6 +382,17 @@ fn run(seed: u64, steps: usize, seen: &mut Seen) {
     );
 }
 
+/// Seed and size for the endless test runner (scripts/soak.sh), which wants
+/// different random sequences on every pass. Unset, the long runs are the
+/// same every time.
+fn soak(default_seed: u64, default_rounds: u64) -> (u64, u64) {
+    let read = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+    (
+        read("TWOF_SOAK_SEED").unwrap_or(default_seed),
+        read("TWOF_SOAK_ROUNDS").unwrap_or(default_rounds),
+    )
+}
+
 #[test]
 fn random_operations_agree_with_the_model() {
     let mut seen = Seen::default();
@@ -408,13 +419,24 @@ fn random_operations_agree_with_the_model() {
 #[test]
 #[ignore]
 fn random_operations_long_run() {
+    let (base, rounds) = soak(3, 400);
     let mut seen = Seen::default();
-    for seed in 1..=400 {
-        run(seed * 104_729 + 3, 1500, &mut seen);
+    for round in 1..=rounds {
+        run(
+            base.wrapping_add(round.wrapping_mul(104_729)),
+            1500,
+            &mut seen,
+        );
     }
     println!(
         "allowed {} approved {} rejected {} expired {} refused {} flood {} used {} reuse refused {}",
-        seen.allowed, seen.approved, seen.rejected, seen.expired, seen.refused, seen.flood,
-        seen.consumed, seen.reused
+        seen.allowed,
+        seen.approved,
+        seen.rejected,
+        seen.expired,
+        seen.refused,
+        seen.flood,
+        seen.consumed,
+        seen.reused
     );
 }

@@ -143,7 +143,11 @@ fn action(rng: &mut Rng) -> Option<Value> {
 
 #[test]
 fn random_corpus_is_self_consistent() {
-    let mut rng = Rng(0x2f2f_2f2f_2f2f_2f2f);
+    // The endless runner (scripts/soak.sh) asks for a new corpus each pass.
+    let seed = std::env::var("TWOF_SOAK_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut rng = Rng(seed.unwrap_or(0x2f2f_2f2f_2f2f_2f2f) | 1);
     let mut values = Vec::new();
     while values.len() < 3000 {
         let v = value(&mut rng, 0);

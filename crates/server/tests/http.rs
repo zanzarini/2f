@@ -277,7 +277,11 @@ async fn random_garbage_never_breaks_the_server() {
     let (_, _, created) = send(&app, post("/v1/challenges", Some(&app.key), CREATE)).await;
     let id = created["id"].as_str().unwrap().to_owned();
 
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    // The endless runner (scripts/soak.sh) asks for new garbage each pass.
+    let seed = std::env::var("TWOF_SOAK_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut state = seed.unwrap_or(0x9e37_79b9_7f4a_7c15u64) | 1;
     let mut next = move || {
         state ^= state << 13;
         state ^= state >> 7;

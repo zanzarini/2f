@@ -55,6 +55,22 @@ Known survivors, and why they are left:
 - **Floats in the Python client.** Removing the explicit check lets the value
   fall through to the generic "unsupported value" refusal.
 
+## Leaving it running
+
+`scripts/soak.sh` runs the random model, the random adversary, the garbage
+test, the live server test and the cross language check in an endless loop,
+with new random seeds on every pass and several workers side by side. It
+writes one line per run to `soak/summary.log` and keeps the full output of
+anything that fails, together with its seed, in `soak/failures/`.
+
+```bash
+bash scripts/soak.sh soak 12      # 12 workers, until a file named soak/STOP exists
+bash scripts/soak-report.sh soak  # totals so far
+```
+
+A failure can be replayed with the seed from its line:
+`TWOF_SOAK_SEED=<seed> TWOF_SOAK_ROUNDS=<rounds> cargo test --release -p twof-server --test adversary -- --ignored`.
+
 ## What none of this covers
 
 Passkeys on real phones and browsers, the Telegram delivery, the Docker image,

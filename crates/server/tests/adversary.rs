@@ -357,6 +357,17 @@ fn run(seed: u64, seen: &mut Seen) {
     cleanup(&path);
 }
 
+/// Seed and size for the endless test runner (scripts/soak.sh), which wants
+/// different random sequences on every pass. Unset, the long runs are the
+/// same every time.
+fn soak(default_seed: u64, default_rounds: u64) -> (u64, u64) {
+    let read = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+    (
+        read("TWOF_SOAK_SEED").unwrap_or(default_seed),
+        read("TWOF_SOAK_ROUNDS").unwrap_or(default_rounds),
+    )
+}
+
 #[test]
 fn nothing_written_into_the_database_produces_an_unsupported_receipt() {
     let mut seen = Seen::default();
@@ -383,9 +394,10 @@ fn nothing_written_into_the_database_produces_an_unsupported_receipt() {
 #[test]
 #[ignore]
 fn adversary_long_run() {
+    let (base, rounds) = soak(11, 3000);
     let mut seen = Seen::default();
-    for seed in 1..=3000 {
-        run(seed * 15_485_863 + 11, &mut seen);
+    for round in 1..=rounds {
+        run(base.wrapping_add(round.wrapping_mul(15_485_863)), &mut seen);
     }
     println!(
         "receipts {} approved {} tamperings {} honest approvals refused {}",
