@@ -35,8 +35,8 @@ twof init                                   # creates twof.db and twof.key
 PROJECT=$(twof project create "My exchange")
 twof policy set $PROJECT examples/policy.json
 twof apikey create $PROJECT                 # shown once
-twof approver add $PROJECT wesley
-twof credential invite $PROJECT wesley      # link to register a passkey
+twof approver add $PROJECT alice
+twof credential invite $PROJECT alice      # link to register a passkey
 twof pubkey                                 # pin this in your clients
 twof serve
 ```

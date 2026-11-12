@@ -142,7 +142,7 @@ enum PolicyCmd {
 enum ApproverCmd {
     Add {
         project: String,
-        /// Short identifier, for example "wesley".
+        /// Short identifier, for example "alice".
         id: String,
         #[arg(long)]
         name: Option<String>,
