@@ -1,12 +1,12 @@
 # Threat model
 
 2F sits between a system that wants to execute a transaction (the client) and
-the execution itself. The client asks 2F "may I do exactly this?", and only
-executes when it holds a valid receipt for exactly that action.
+the execution itself. The client submits the exact action to 2F and executes
+only when it holds a valid receipt for that action.
 
-Nothing here is "unbreakable". This document states what an attacker can and
-cannot do in each compromise scenario, so the claims can be checked. Each row
-of the table has tests behind it; the file is named in the last column.
+This document states what an attacker can and cannot do in each compromise
+scenario. Each row of the table is backed by tests; the file is named in the
+last column.
 
 ## Assets
 
@@ -20,9 +20,9 @@ of the table has tests behind it; the file is named in the last column.
 
 | Scenario | What the attacker can do | What still holds | Tests |
 |---|---|---|---|
-| Stolen client API key | Create challenges and read their status | Cannot approve. Anything outside the auto-allow rules still needs an approver signature. Damage is bounded by the policy limits and velocity caps. Approvers cannot be buried in requests until one slips through: a project has a small limit of approvals waiting at once (`--max-pending`, 20 by default). | `flow.rs` |
+| Stolen client API key | Create challenges and read their status | Cannot approve. Anything outside the auto-allow rules still needs an approver signature. Damage is bounded by the policy limits and velocity caps. Approvers cannot be flooded with requests: a project has a small limit of approvals waiting at once (`--max-pending`, 20 by default). | `flow.rs` |
 | A careless or hostile network path to the server | Read or redirect what the client sends | The SDKs refuse plain HTTP except to the local machine, so the API key is not sent in the clear, and they do not follow redirects, which would carry the key elsewhere. | SDK tests |
-| The same authorization acted on twice | Retry after a crash, or replay a response | `authorize` in the SDKs marks the receipt as used before returning. A second attempt with the same idempotency key gets "conflict" instead of a second go-ahead. | SDK tests, `flow.rs` |
+| The same authorization acted on twice | Retry after a crash, or replay a response | `authorize` in the SDKs marks the receipt as used before returning. A second attempt with the same idempotency key returns a conflict instead of a second authorization. | SDK tests, `flow.rs` |
 | Database copy leaked (read) | Read public keys, API key hashes, history | Cannot approve (no private keys), cannot call the API (hashes only), cannot issue receipts (the signing key is not there). A server started on that file with any other key refuses to operate at all. | `flow.rs` |
 | Database write access | Insert, edit or delete rows | Cannot grant themselves power. Credentials, API keys, policies, enrollment links, notification settings and every challenge (its state, requirements and deadline) are sealed with the server key; a row without a valid seal is ignored or refused, and an edited policy fails closed to "deny everything". A planted approval does not count: each stored signature is verified again when the quorum is counted. The approver is never shown an action other than the one whose hash is signed. A decided challenge, a used receipt, a revoked credential or API key and a replaced policy cannot be put back, even with their genuine old seals: what is in force is taken from the signed log, and the server stops if the log is cut, altered or extended by anyone else. Notifications planted or redirected in the queue are not sent. The audit log cannot be extended (every entry is signed), and `twof audit verify` reports rows that no longer match it: grants, policies, challenge states, used receipts. | `tamper.rs`, `channels.rs` |
 | Network attacker or tampering client | Replay or alter requests | Receipts bind the hash of the canonical action; changing amount or destination invalidates them. Receipts expire in minutes and are consumed once. Approvals are bound to one challenge. | `flow.rs`, core |
@@ -57,8 +57,6 @@ of the table has tests behind it; the file is named in the last column.
 
 ## Known limits
 
-Stated plainly so nobody relies on something that is not there.
-
 - **Cutting the end off the audit log** is only detected against a checkpoint
   kept somewhere the server cannot write. Run `twof audit checkpoint` on a
   schedule and store the output elsewhere.
@@ -74,7 +72,7 @@ Stated plainly so nobody relies on something that is not there.
 - **Stopping the server is easy for whoever can write to the database.**
   Damaging the log makes the server refuse to operate. That is the intended
   direction of failure, but it is an outage.
-- **A stolen API key can use up the waiting room.** The limit of approvals
+- **A stolen API key can fill the pending queue.** The limit of approvals
   waiting at once protects approvers from being flooded; the price is that
   whoever holds a project's key can keep that project's queue full. Revoke the
   key (`twof apikey revoke-all`).
@@ -99,8 +97,8 @@ Stated plainly so nobody relies on something that is not there.
   2F itself: run it behind a reverse proxy, which is needed for HTTPS anyway.
 - **Rules match exactly.** `"usdt"` is not `"USDT"`, and an address in another
   letter case is another address. Write rules that allow what you know and
-  send everything else to a person, rather than rules that deny what you
-  fear: a deny rule is only as good as its spelling.
+  send everything else to an approver, rather than rules that deny specific
+  values: a deny rule only matches the exact spelling it lists.
 - **Real device coverage.** Passkey verification is tested against a software
   authenticator that follows the WebAuthn specification, not yet against a
   matrix of real phones and browsers.

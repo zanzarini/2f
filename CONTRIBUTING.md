@@ -1,6 +1,6 @@
 # Contributing
 
-## Before you send a change
+## Before submitting a change
 
 ```bash
 cargo fmt --all
@@ -13,15 +13,14 @@ bash scripts/e2e.sh
 
 CI runs the same commands.
 
-## Ground rules
+## Guidelines
 
 - **A claim needs a test.** If a change adds a defence, add the test that
   attacks it. If it changes a row of `docs/THREAT_MODEL.md`, update the row.
 - **The model test must agree.** `crates/server/tests/model.rs` runs random
   operations against an independent model of the rules. A change in behaviour
   means changing the model on purpose, in the same commit.
-- **Fail closed.** When something cannot be parsed, read or verified, the
-  answer is no.
+- **Fail closed.** Input that cannot be parsed, read or verified is refused.
 - **No new cryptography.** Ed25519, ECDSA P-256 and SHA-256, through audited
   crates. New signed structures get their own domain tag.
 - **`crates/core` stays pure.** No network, no clock, no disk.
@@ -32,9 +31,9 @@ CI runs the same commands.
 
 ## Layout
 
-See the repository map in the [README](README.md#repository-map) and the
+See the repository map in the [README](README.md#repository-layout) and the
 diagrams in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Reporting security problems
 
-Not in a public issue, please. See [SECURITY.md](SECURITY.md).
+Do not use public issues. See [SECURITY.md](SECURITY.md).

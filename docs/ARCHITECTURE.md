@@ -1,22 +1,22 @@
 # Architecture
 
-Maps of how 2F works, from the outside in. Wire formats are in
-[PROTOCOL.md](PROTOCOL.md); what each defence is for is in
+Structure and behaviour of 2F. Wire formats are specified in
+[PROTOCOL.md](PROTOCOL.md); the purpose of each defence is given in
 [THREAT_MODEL.md](THREAT_MODEL.md).
 
-- [1. The big picture](#1-the-big-picture)
-- [2. One approval, step by step](#2-one-approval-step-by-step)
-- [3. Life of a challenge](#3-life-of-a-challenge)
-- [4. What is signed, and by whom](#4-what-is-signed-and-by-whom)
-- [5. How a rule decides](#5-how-a-rule-decides)
-- [6. Inside the server](#6-inside-the-server)
-- [7. Why it is fast](#7-why-it-is-fast)
-- [8. Where the trust lives](#8-where-the-trust-lives)
+- [1. Overview](#1-overview)
+- [2. Approval sequence](#2-approval-sequence)
+- [3. Challenge lifecycle](#3-challenge-lifecycle)
+- [4. Signatures](#4-signatures)
+- [5. Policy evaluation](#5-policy-evaluation)
+- [6. Server internals](#6-server-internals)
+- [7. Performance](#7-performance)
+- [8. Trust boundaries](#8-trust-boundaries)
 
-## 1. The big picture
+## 1. Overview
 
-Your system never executes on its own word. It asks 2F, and executes only
-when it holds a receipt for exactly the action it is about to run.
+The calling system does not execute on its own authority. It submits the
+action to 2F and executes only when it holds a receipt for that exact action.
 
 ```mermaid
 flowchart LR
@@ -46,7 +46,7 @@ flowchart LR
     api -.-> log
 ```
 
-## 2. One approval, step by step
+## 2. Approval sequence
 
 A withdrawal to an address the rules do not know, approved by a person.
 
@@ -73,7 +73,7 @@ sequenceDiagram
     C->>C: execute
 ```
 
-## 3. Life of a challenge
+## 3. Challenge lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -93,7 +93,7 @@ stateDiagram-v2
 Only `allowed` and `approved` produce a receipt. A refusal is final: a later
 approval does not revive the challenge.
 
-## 4. What is signed, and by whom
+## 4. Signatures
 
 Every signature covers a hash that leads back to the exact action. Each
 structure has its own tag, so a signature made for one purpose is never valid
@@ -122,7 +122,7 @@ Because the approver signatures travel inside the receipt, a client that pins
 approver public keys can check them itself. That holds even if the 2F server
 is fully compromised.
 
-## 5. How a rule decides
+## 5. Policy evaluation
 
 ```mermaid
 flowchart TD
@@ -140,7 +140,7 @@ Conditions fail closed. A condition on a field the action does not carry does
 not match; a velocity limit whose history cannot be read does not match; a
 policy whose seal does not verify is treated as "deny everything".
 
-## 6. Inside the server
+## 6. Server internals
 
 ```mermaid
 flowchart TB
@@ -180,11 +180,11 @@ whether an action is authorized lives there and is tested in isolation. The
 SDKs in `sdk/` reimplement only the client half (canonical form, hashes,
 receipt verification) and are pinned to the core by shared test vectors.
 
-## 7. Why it is fast
+## 7. Performance
 
-A safe commit costs one disk sync, a few milliseconds. Paying that once per
-request would cap the server at a few hundred writes per second, so the writer
-commits in groups.
+A durable commit costs one disk sync, on the order of milliseconds. One sync
+per request would limit the server to a few hundred writes per second, so the
+writer commits in groups.
 
 ```mermaid
 sequenceDiagram
@@ -210,7 +210,7 @@ sequenceDiagram
   so single use receipts, velocity limits and the audit chain need no locks.
 - Each operation runs in its own savepoint. One refusing does not undo the
   others in its batch.
-- Nobody gets an answer before the data is on disk (`synchronous=FULL`).
+- No response is sent before the data is on disk (`synchronous=FULL`).
 - Reads use a pool of read only connections and never wait for a sync.
 - Clients waiting for an approval are woken by the commit that decides it,
   instead of polling.
@@ -225,10 +225,10 @@ Measured with `cargo test --release -p twof-server --test bench -- --ignored
 | Create, allow by rule and issue a receipt (durable) | about 3,900 per second |
 | Create, approve with a signature and issue a receipt (durable) | about 1,500 per second |
 
-These are in-process numbers for the service layer; HTTP adds its own cost,
-and your disk decides the write figures.
+These are in-process figures for the service layer. HTTP adds overhead, and
+write throughput depends on the storage device.
 
-## 8. Where the trust lives
+## 8. Trust boundaries
 
 ```mermaid
 flowchart LR

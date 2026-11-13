@@ -1,10 +1,10 @@
-# How 2F is tested
+# Testing
 
-No amount of testing proves the absence of flaws. What it can do is make each
-claim cheap to check and expensive to break by accident. These are the layers,
-from the narrowest to the widest, and how to run each.
+Testing does not prove the absence of defects. The layers below make each
+security claim reproducible and make regressions visible. They are listed from
+the narrowest to the widest, with the command for each.
 
-| Layer | What it answers | Where | Run |
+| Layer | Question answered | Location | Command |
 |---|---|---|---|
 | Unit and property tests | Does each piece do what it says, for any input? | `crates/core/src/*` | `cargo test -p twof-core` |
 | Attack tests | Does each row of the threat model hold against the attack it describes? | `crates/server/tests/flow.rs`, `passkey.rs`, `channels.rs`, `http.rs` | `cargo test -p twof-server` |
@@ -25,8 +25,8 @@ who may fill which place is written out by hand, and a quorum is decided by
 trying every assignment. Each random operation (ask, approve, refuse, forge,
 wait, use a receipt, revoke someone) is sent to the real server and the answer
 is compared with what the model expects. The two share no code. The test also
-counts how often each outcome was reached, so a run that never got to an
-approval cannot pass for one that checked approvals.
+counts how often each outcome was reached, so a run that never reached an
+approval is not mistaken for one that verified approvals.
 
 ## The random adversary
 
@@ -68,25 +68,26 @@ not remove it.
 
 ## Mutation testing
 
-A test suite that always passes proves little. `scripts/mutate.py` copies the
-repository, removes one safety check at a time (about seventy of them), and
+Mutation testing measures whether the tests detect a missing check.
+`scripts/mutate.py` copies the repository, removes one safety check at a time
+(about seventy in total), and
 runs the tests against each mutant. A mutant that survives is a check that no
 test defends: either a test is missing or the check is redundant.
 
 ```bash
-python3 scripts/mutate.py .          # Rust; takes a while
+python3 scripts/mutate.py .          # Rust; long running
 python3 scripts/mutate_sdk.py ts . /tmp/sdkmut-ts
 python3 scripts/mutate_sdk.py py . /tmp/sdkmut-py
 ```
 
-Known survivors, and why they are left:
+Known surviving mutants and the reason each is accepted:
 
 - **Receipt of another project consumed.** The project is checked twice, in
   code and in the SQL statement; removing one leaves the other.
 - **Floats in the Python client.** Removing the explicit check lets the value
   fall through to the generic "unsupported value" refusal.
 
-## Leaving it running
+## Continuous run
 
 `scripts/soak.sh` runs the random model, the random adversary, the thread
 storm, the known attacks, the garbage test, the live server test and the cross
@@ -103,7 +104,10 @@ bash scripts/soak-report.sh soak  # totals so far
 A failure can be replayed with the seed from its line:
 `TWOF_SOAK_SEED=<seed> TWOF_SOAK_ROUNDS=<rounds> cargo test --release -p twof-server --test adversary -- --ignored`.
 
-## What none of this covers
+## Not covered
 
-Passkeys on real phones and browsers, the Telegram delivery, the Docker image,
-and anyone other than the author trying to break it.
+- Passkeys on physical phones and browsers (verified against a software
+  authenticator only).
+- Delivery through the Telegram API.
+- The Docker image build.
+- Independent third-party review.

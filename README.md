@@ -13,12 +13,9 @@
   <b>English</b> · <a href="README.pt-BR.md">Português</a>
 </p>
 
-Ordinary 2FA protects a person logging in. When a transfer is triggered by a
-bot, an integration or an AI agent, there is usually no second factor at all,
-or it is a second secret sitting on the same server.
-
-**2F is a small self hosted service your system asks before executing:
-_may I do exactly this?_**
+2F is a self-hosted authorization service for transactions initiated through
+an API by bots, integrations or AI agents. Before executing, the calling system
+submits the exact action to 2F and proceeds only with a signed receipt for it.
 
 - **Rules** decide whether an action passes alone, needs approval, or is refused.
 - **Approvers** sign the exact action (amount, asset, destination) with a key
@@ -28,15 +25,15 @@ _may I do exactly this?_**
   minutes and usable once.
 - **Every event** lands in a signed, hash chained audit log.
 
-It is not "unbreakable", and it does not claim to be. The
-[threat model](docs/THREAT_MODEL.md) says what an attacker can and cannot do in
-each scenario, and names the tests behind each claim.
+The [threat model](docs/THREAT_MODEL.md) states what an attacker can and
+cannot do in each compromise scenario and references the tests behind each
+claim.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    bot["Your bot, backend<br/>or AI agent"] -- "may I do exactly this?" --> twof{"2F rules"}
+    bot["Bot, backend<br/>or AI agent"] -- "action" --> twof{"2F rules"}
     twof -- "allow" --> receipt(["Signed receipt"])
     twof -- "require" --> people["Approvers sign<br/>the exact action"]
     people --> receipt
@@ -49,7 +46,7 @@ sequenceDiagram
     participant C as Your system
     participant S as 2F
     participant A as Approver
-    C->>S: this action, please
+    C->>S: create challenge (action)
     S-->>C: pending
     S-)A: approval link
     A->>S: signature over the exact action
@@ -59,10 +56,10 @@ sequenceDiagram
     C->>C: execute
 ```
 
-More maps, including what is signed by whom and how the storage engine batches
-commits, are in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+Further diagrams, covering the signature chain and the storage engine, are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## What the approver sees
+## Approval page
 
 <p align="center">
   <img src="docs/img/approve-light.jpg" alt="Approval page, light" width="270">
@@ -72,8 +69,8 @@ commits, are in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
   <img src="docs/img/enroll.jpg" alt="Passkey registration" width="270">
 </p>
 
-The page is served by 2F itself: no app to install. The device signs exactly
-what is on screen, and the signature is useless for any other action.
+The page is served by 2F and requires no application. The device signs the
+action displayed, and the signature is not valid for any other action.
 
 ## Quick start
 
@@ -89,10 +86,10 @@ twof pubkey                                 # pin this in your clients
 twof serve
 ```
 
-`bash scripts/demo.sh` starts a throwaway server and prints a registration
-link and an approval link to try in a browser.
+`bash scripts/demo.sh` starts a temporary server and prints a registration
+link and an approval link for use in a browser.
 
-## Integrating
+## Integration
 
 <table>
 <tr><th>TypeScript</th><th>Python</th></tr>
@@ -139,8 +136,9 @@ if result.authorized:
 </table>
 
 Both clients verify the receipt locally, against the pinned server key and the
-action you are about to execute, and mark it as used before returning: a retry
-with the same idempotency key gets "conflict" instead of a second go-ahead.
+action about to be executed, and mark it as used before returning. A retry
+with the same idempotency key returns a conflict instead of a second
+authorization.
 Amounts are always decimal strings, never numbers. The clients refuse plain
 HTTP to anything but the local machine.
 
@@ -173,18 +171,18 @@ A complete example is in [examples/policy.json](examples/policy.json).
 | Telegram | a message with the approval link. It notifies; it never approves |
 | Webhooks | `challenge.pending`, `approved`, `rejected`, `expired`, signed with the server key |
 
-## Built to hold
+## Security properties
 
 | | |
 |---|---|
 | **Bound to the action** | Receipts and approvals cover the SHA-256 of a canonical form. Change one digit of the amount and nothing verifies. |
-| **Nothing to steal in the database** | Public keys and hashes only. The signing key lives outside it. |
-| **Nothing to plant in the database** | Credentials, API keys, policies, enrollment links and every challenge are sealed with the server key. A row written by someone else is ignored; an edited policy denies everything; a planted approval does not count. |
-| **The log decides** | Hash chained and signed entry by entry. The server takes what is in force from it, so a revoked credential or a replaced policy cannot be put back in the tables, and it stops if the log is cut or altered. `twof audit verify` reports anything the log does not explain. |
-| **Does not trust itself** | Clients can pin device and co-signer keys and check their signatures inside the receipt, and the approval page and terminal approver recompute what they sign, so even a compromised 2F server cannot invent one of those approvals. |
-| **Fast** | Group commit and a read pool: about 3,000 durable authorizations per second and 450,000 reads per second in the [benchmark](docs/ARCHITECTURE.md#7-why-it-is-fast), on a laptop. |
+| **No secrets in the database** | Public keys and hashes only. The signing key lives outside it. |
+| **Sealed records** | Credentials, API keys, policies, enrollment links and every challenge are sealed with the server key. A row written by someone else is ignored; an edited policy denies everything; a planted approval does not count. |
+| **Authoritative audit log** | Hash chained and signed entry by entry. The server takes what is in force from it, so a revoked credential or a replaced policy cannot be put back in the tables, and it stops if the log is cut or altered. `twof audit verify` reports anything the log does not explain. |
+| **Independent verification** | Clients can pin device and co-signer keys and check their signatures inside the receipt, and the approval page and terminal approver recompute what they sign, so even a compromised 2F server cannot invent one of those approvals. |
+| **Performance** | Group commit and a read pool: about 3,000 durable authorizations per second and 450,000 reads per second in the [benchmark](docs/ARCHITECTURE.md#7-performance) on a laptop. |
 
-## Deploying
+## Deployment
 
 The `Dockerfile` builds a single binary image that listens on port 8722 and
 keeps its data in `/data`. Put it behind HTTPS (passkeys require it outside
@@ -199,9 +197,9 @@ keeps its data in `/data`. Put it behind HTTPS (passkeys require it outside
 Run `twof audit verify` to check the log, and `twof audit checkpoint` on a
 schedule, storing its output somewhere the server cannot write.
 
-## Repository map
+## Repository layout
 
-| Path | What is there |
+| Path | Contents |
 |---|---|
 | [`crates/core`](crates/core/src) | Canonical JSON, rules, receipts, passkey verification, audit chain, seals. No IO. |
 | [`crates/server`](crates/server/src) | HTTP API, operations, storage engine, deliveries, co-signer. |
@@ -209,7 +207,7 @@ schedule, storing its output somewhere the server cannot write.
 | [`web`](web) | The approval and registration page. |
 | [`sdk/ts`](sdk/ts), [`sdk/python`](sdk/python) | Clients. |
 | [`docs`](docs) | [Architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md), [threat model](docs/THREAT_MODEL.md), [testing](docs/TESTING.md). |
-| [`scripts`](scripts) | End to end test and demo. |
+| [`scripts`](scripts) | End-to-end test, demo, cross-language check, mutation testing and the continuous test runner. |
 
 ## Development
 
@@ -220,12 +218,12 @@ bash scripts/e2e.sh           # real server, real HTTP, co-signer included
 (cd sdk/python && python -m unittest)
 ```
 
-`sdk/vectors.json` is generated by the Rust core and checked by both SDKs, so
-the three implementations cannot drift apart. Beyond the ordinary tests there
-is a random model, a random adversary, a cross language check and mutation
-testing: [docs/TESTING.md](docs/TESTING.md) explains each and how to run it. See
-[CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md) to report a
-vulnerability.
+`sdk/vectors.json` is generated by the Rust core and checked by both SDKs,
+which keeps the three implementations consistent. The test strategy (random
+model, random adversary, known attack catalogue, concurrency, cross-language
+and mutation testing) is described in [docs/TESTING.md](docs/TESTING.md). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and
+[SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 

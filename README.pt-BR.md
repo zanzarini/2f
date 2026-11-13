@@ -6,13 +6,9 @@
   <a href="README.md">English</a> · <b>Português</b>
 </p>
 
-O 2FA comum protege uma pessoa fazendo login. Quando a transferência é
-disparada por um bot, uma integração ou um agente de IA, normalmente não
-existe segundo fator nenhum, ou ele é só uma segunda senha guardada no mesmo
-servidor.
-
-**O 2F é um serviço pequeno, que você mesmo hospeda, e que o seu sistema
-consulta antes de executar: _posso fazer exatamente isto?_**
+O 2F é um serviço de autorização auto-hospedado para transações iniciadas por
+API, por bots, integrações ou agentes de IA. Antes de executar, o sistema envia
+a ação exata ao 2F e só prossegue com um comprovante assinado para ela.
 
 - **Regras** decidem se a ação passa sozinha, precisa de aprovação ou é negada.
 - **Aprovadores** assinam a ação exata (valor, ativo, destino) com uma chave
@@ -22,15 +18,15 @@ consulta antes de executar: _posso fazer exatamente isto?_**
   válido por minutos e de uso único.
 - **Todo evento** vai para um registro de auditoria assinado e encadeado.
 
-Ele não é "inquebrável" e não promete ser. O
-[modelo de ameaças](docs/THREAT_MODEL.md) diz o que um invasor consegue e não
-consegue em cada cenário, e aponta os testes por trás de cada afirmação.
+O [modelo de ameaças](docs/THREAT_MODEL.md) descreve o que um invasor consegue
+e não consegue em cada cenário de comprometimento e indica os testes que
+sustentam cada afirmação.
 
 ## Como funciona
 
 ```mermaid
 flowchart LR
-    bot["Seu bot, backend<br/>ou agente de IA"] -- "posso fazer exatamente isto?" --> twof{"Regras do 2F"}
+    bot["Bot, backend<br/>ou agente de IA"] -- "ação" --> twof{"Regras do 2F"}
     twof -- "libera" --> receipt(["Comprovante assinado"])
     twof -- "exige aprovação" --> people["Aprovadores assinam<br/>a ação exata"]
     people --> receipt
@@ -43,7 +39,7 @@ sequenceDiagram
     participant C as Seu sistema
     participant S as 2F
     participant A as Aprovador
-    C->>S: quero fazer esta ação
+    C->>S: cria o pedido (ação)
     S-->>C: pendente
     S-)A: link de aprovação
     A->>S: assinatura sobre a ação exata
@@ -53,11 +49,11 @@ sequenceDiagram
     C->>C: executa
 ```
 
-Os outros mapas (o que é assinado e por quem, o ciclo de vida de um pedido,
-como o banco agrupa as gravações) estão em
-**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**, em inglês.
+Os demais diagramas (cadeia de assinaturas, ciclo de vida de um pedido,
+mecanismo de armazenamento) estão em
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), em inglês.
 
-## O que o aprovador vê
+## Página de aprovação
 
 <p align="center">
   <img src="docs/img/approve-light.jpg" alt="Página de aprovação, tema claro" width="270">
@@ -67,11 +63,11 @@ como o banco agrupa as gravações) estão em
   <img src="docs/img/enroll.jpg" alt="Cadastro de passkey" width="270">
 </p>
 
-A página é servida pelo próprio 2F, sem aplicativo para instalar, e aparece em
-português quando o aparelho está em português. O dispositivo assina exatamente
-o que está na tela, e a assinatura não serve para nenhuma outra ação.
+A página é servida pelo próprio 2F, não exige aplicativo e é exibida em
+português quando o aparelho está em português. O dispositivo assina a ação
+exibida, e a assinatura não é válida para nenhuma outra ação.
 
-## Começando
+## Início rápido
 
 ```bash
 cargo build --release
@@ -85,8 +81,8 @@ twof pubkey                                 # fixe este valor nos seus clientes
 twof serve
 ```
 
-`bash scripts/demo.sh` sobe um servidor descartável e mostra um link de
-cadastro e um de aprovação para testar no navegador.
+`bash scripts/demo.sh` inicia um servidor temporário e exibe um link de
+cadastro e um de aprovação para uso no navegador.
 
 ## Regras
 
@@ -117,24 +113,24 @@ Exemplo completo em [examples/policy.json](examples/policy.json).
 | Telegram | mensagem com o link de aprovação. Avisa, nunca aprova |
 | Webhooks | eventos assinados com a chave do servidor |
 
-## Feito para aguentar
+## Propriedades de segurança
 
 | | |
 |---|---|
-| **Amarrado à ação** | Comprovantes e aprovações cobrem o SHA-256 de uma forma canônica. Mudou um dígito do valor, nada mais confere. |
-| **Nada para roubar no banco** | Só chaves públicas e hashes. A chave de assinatura fica fora dele. |
-| **Nada para plantar no banco** | Credenciais, chaves de API, regras, links de cadastro e cada pedido levam um selo da chave do servidor. Linha escrita por outra pessoa é ignorada; regra adulterada nega tudo; aprovação plantada não conta. |
-| **O registro decide** | Encadeado e assinado entrada por entrada. O servidor tira dele o que está valendo, então credencial revogada ou regra substituída não volta pelas tabelas, e ele para se o registro for cortado ou alterado. `twof audit verify` aponta o que o registro não explica. |
-| **Não confia em si mesmo** | O cliente pode fixar as chaves de dispositivo e de co-assinador e conferir as assinaturas dentro do comprovante, e a página e o aprovador de terminal recalculam o que assinam, então nem um servidor 2F invadido inventa uma dessas aprovações. |
-| **Rápido** | Gravação em lote e leituras em paralelo: cerca de 3.000 autorizações duráveis por segundo e 450.000 leituras por segundo na [medição](docs/ARCHITECTURE.md#7-why-it-is-fast), em um notebook. |
+| **Vinculado à ação** | Comprovantes e aprovações cobrem o SHA-256 de uma forma canônica. A alteração de um único dígito do valor invalida ambos. |
+| **Banco sem segredos** | Só chaves públicas e hashes. A chave de assinatura fica fora dele. |
+| **Registros selados** | Credenciais, chaves de API, regras, links de cadastro e cada pedido levam um selo da chave do servidor. Linha escrita por outra pessoa é ignorada; regra adulterada nega tudo; aprovação plantada não conta. |
+| **Registro de auditoria como fonte** | Encadeado e assinado entrada por entrada. O servidor tira dele o que está valendo, então credencial revogada ou regra substituída não volta pelas tabelas, e ele para se o registro for cortado ou alterado. `twof audit verify` aponta o que o registro não explica. |
+| **Verificação independente** | O cliente pode fixar as chaves de dispositivo e de co-assinador e conferir as assinaturas dentro do comprovante, e a página e o aprovador de terminal recalculam o que assinam, então nem um servidor 2F invadido inventa uma dessas aprovações. |
+| **Desempenho** | Gravação em lote e leituras em paralelo: cerca de 3.000 autorizações duráveis por segundo e 450.000 leituras por segundo na [medição](docs/ARCHITECTURE.md#7-performance) em um notebook. |
 
-## Publicando
+## Implantação
 
 O `Dockerfile` gera uma imagem com um único binário, na porta 8722, com os
 dados em `/data`. Coloque atrás de HTTPS (passkey exige isso fora de
 `localhost`) e configure:
 
-| Variável | Para quê |
+| Variável | Finalidade |
 |---|---|
 | `TWOF_PUBLIC_URL` | o endereço que os aprovadores abrem, por exemplo `https://2f.exemplo.com` |
 | `TWOF_KEY` | semente da chave de assinatura em hexadecimal, como segredo, para não ficar ao lado do banco |

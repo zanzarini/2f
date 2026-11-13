@@ -1,23 +1,23 @@
 # Security policy
 
-2F is security software. Reports of weaknesses are welcome and treated as the
-most useful contributions the project can receive.
+2F is security software. Vulnerability reports are welcome and are handled
+with priority.
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for something exploitable. Use GitHub's
-private reporting instead: **Security → Report a vulnerability** on this
-repository.
+Do not open a public issue for an exploitable problem. Use GitHub's private
+reporting: **Security → Report a vulnerability** on this repository.
 
-Include what you can of:
+Include, where possible:
 
 - which claim in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) does not hold;
 - the smallest sequence of requests or database changes that shows it;
 - the version or commit you tested.
 
-You will get an acknowledgement, and credit in the fix unless you prefer not.
+Reports are acknowledged, and reporters are credited in the fix unless they
+ask otherwise.
 
-## What counts
+## Scope
 
 Anything that breaks a row of the threat model table, for example:
 
@@ -27,9 +27,8 @@ Anything that breaks a row of the threat model table, for example:
 - a change to the audit log that `twof audit verify` does not report;
 - an approval page that displays something other than what is signed.
 
-The "Known limits" section of the threat model lists what is already known and
-accepted; a report that turns one of those into a practical attack is still
-welcome.
+The "Known limits" section of the threat model lists accepted limitations. A
+report that turns one of them into a practical attack is in scope.
 
 ## Supported versions
 
