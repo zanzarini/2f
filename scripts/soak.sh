@@ -46,8 +46,9 @@ STORM=$(program storm)
 HTTP=$(program http)
 LIVE=$(program live)
 TAMPER=$(program tamper)
+KNOWN=$(program known)
 CORPUS=$(program corpus)
-for found in "$MODEL" "$ADVERSARY" "$STORM" "$HTTP" "$LIVE" "$TAMPER" "$CORPUS"; do
+for found in "$MODEL" "$ADVERSARY" "$STORM" "$HTTP" "$LIVE" "$TAMPER" "$KNOWN" "$CORPUS"; do
   [ -x "$found" ] || { log "event=build_failed reason=missing_test_program"; exit 1; }
 done
 log "event=start commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) workers=$WORKERS cores=$(nproc) model_rounds=$MODEL_ROUNDS adversary_rounds=$ADVERSARY_ROUNDS storm_rounds=$STORM_ROUNDS"
@@ -86,6 +87,9 @@ worker() {
     TWOF_SOAK_ROUNDS=$STORM_ROUNDS run "$worker" "$pass" "$seed" storm $((STORM_ROUNDS * 12 * 400)) \
       "$STORM" --ignored --nocapture
     run "$worker" "$pass" "$seed" race 9000 "$TAMPER" readers_racing concurrent_writers
+    # The publicly known ways around a second factor, with new guesses and
+    # new forged receipts on every pass.
+    run "$worker" "$pass" "$seed" known 4000 "$KNOWN"
     run "$worker" "$pass" "$seed" garbage 1500 "$HTTP" random_garbage
     run "$worker" "$pass" "$seed" live 130 "$LIVE"
     # The suites below use fixed ports or shared files: one worker only.
