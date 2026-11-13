@@ -10,9 +10,10 @@
 set -u
 cd "$(dirname "$0")/.."
 OUT="${1:-soak}"
-WORKERS="${2:-$(( $(nproc) / 2 > 0 ? $(nproc) / 2 : 1 ))}"
+WORKERS="${2:-$(( $(nproc) > 4 ? $(nproc) - 4 : 1 ))}"
 MODEL_ROUNDS="${SOAK_MODEL_ROUNDS:-300}"
 ADVERSARY_ROUNDS="${SOAK_ADVERSARY_ROUNDS:-600}"
+STORM_ROUNDS="${SOAK_STORM_ROUNDS:-40}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 mkdir -p "$OUT/failures"
 rm -f "$OUT/STOP"
@@ -41,18 +42,21 @@ for line in sys.stdin:
 program() { echo "$PROGRAMS" | awk -v name="$1" '$1 == name { print $2 }' | tail -1; }
 MODEL=$(program model)
 ADVERSARY=$(program adversary)
+STORM=$(program storm)
 HTTP=$(program http)
 LIVE=$(program live)
+TAMPER=$(program tamper)
 CORPUS=$(program corpus)
-for found in "$MODEL" "$ADVERSARY" "$HTTP" "$LIVE" "$CORPUS"; do
+for found in "$MODEL" "$ADVERSARY" "$STORM" "$HTTP" "$LIVE" "$TAMPER" "$CORPUS"; do
   [ -x "$found" ] || { log "event=build_failed reason=missing_test_program"; exit 1; }
 done
-log "event=start commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) workers=$WORKERS cores=$(nproc) model_rounds=$MODEL_ROUNDS adversary_rounds=$ADVERSARY_ROUNDS"
+log "event=start commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) workers=$WORKERS cores=$(nproc) model_rounds=$MODEL_ROUNDS adversary_rounds=$ADVERSARY_ROUNDS storm_rounds=$STORM_ROUNDS"
 
-# run <worker> <pass> <seed> <suite> <command...>
+# run <worker> <pass> <seed> <suite> <operations> <command...>
+# <operations> is how many individual operations the suite performs.
 run() {
-  local worker=$1 pass=$2 seed=$3 suite=$4
-  shift 4
+  local worker=$1 pass=$2 seed=$3 suite=$4 operations=$5
+  shift 5
   local output="$OUT/last-$suite-w$worker.log" started result detail
   started=$(date +%s)
   if "$@" > "$output" 2>&1; then
@@ -62,8 +66,8 @@ run() {
     cp "$output" "$OUT/failures/$(date -u +%Y%m%dT%H%M%SZ)-$suite-w$worker-seed$seed.log"
   fi
   # The long runs print one line of counters; keep it with the result.
-  detail=$(grep -E "^(allowed|receipts) [0-9]" "$output" | tail -1 | tr ' ' '_')
-  log "worker=$worker pass=$pass seed=$seed suite=$suite result=$result secs=$(( $(date +%s) - started )) counts=${detail:--}"
+  detail=$(grep -E "^(allowed|receipts|storm) " "$output" | tail -1 | tr ' ' '_')
+  log "worker=$worker pass=$pass seed=$seed suite=$suite result=$result secs=$(( $(date +%s) - started )) ops=$operations counts=${detail:--}"
 }
 
 worker() {
@@ -72,19 +76,25 @@ worker() {
     pass=$((pass + 1))
     seed=$(od -An -N7 -tu8 /dev/urandom | tr -d ' ')
     export TWOF_SOAK_SEED=$seed
-    TWOF_SOAK_ROUNDS=$MODEL_ROUNDS run "$worker" "$pass" "$seed" model "$MODEL" --ignored --nocapture
+    TWOF_SOAK_ROUNDS=$MODEL_ROUNDS run "$worker" "$pass" "$seed" model $((MODEL_ROUNDS * 1500)) \
+      "$MODEL" --ignored --nocapture
     [ -e "$OUT/STOP" ] && break
-    TWOF_SOAK_ROUNDS=$ADVERSARY_ROUNDS run "$worker" "$pass" "$seed" adversary "$ADVERSARY" --ignored --nocapture
+    TWOF_SOAK_ROUNDS=$ADVERSARY_ROUNDS run "$worker" "$pass" "$seed" adversary $((ADVERSARY_ROUNDS * 90)) \
+      "$ADVERSARY" --ignored --nocapture
     [ -e "$OUT/STOP" ] && break
-    run "$worker" "$pass" "$seed" garbage "$HTTP" random_garbage
-    run "$worker" "$pass" "$seed" live "$LIVE"
+    # Many threads on one server: where timing bugs live.
+    TWOF_SOAK_ROUNDS=$STORM_ROUNDS run "$worker" "$pass" "$seed" storm $((STORM_ROUNDS * 12 * 400)) \
+      "$STORM" --ignored --nocapture
+    run "$worker" "$pass" "$seed" race 9000 "$TAMPER" readers_racing concurrent_writers
+    run "$worker" "$pass" "$seed" garbage 1500 "$HTTP" random_garbage
+    run "$worker" "$pass" "$seed" live 130 "$LIVE"
     # The suites below use fixed ports or shared files: one worker only.
     if [ "$worker" -eq 1 ]; then
-      TWOF_WRITE_CORPUS=1 run "$worker" "$pass" "$seed" languages \
+      TWOF_WRITE_CORPUS=1 run "$worker" "$pass" "$seed" languages 4500 \
         bash -c "'$CORPUS' && cd sdk/python && python3 crosscheck.py"
       if [ $((pass % 5)) -eq 0 ]; then
-        ( unset TWOF_SOAK_SEED; run "$worker" "$pass" "$seed" everything cargo test --release -q --workspace )
-        run "$worker" "$pass" "$seed" endtoend bash scripts/e2e.sh "$CARGO_TARGET_DIR/release/twof"
+        ( unset TWOF_SOAK_SEED; run "$worker" "$pass" "$seed" everything 0 cargo test --release -q --workspace )
+        run "$worker" "$pass" "$seed" endtoend 30 bash scripts/e2e.sh "$CARGO_TARGET_DIR/release/twof"
       fi
       # Databases left behind by a test that died.
       find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'twof-*' -mmin +60 -delete 2>/dev/null

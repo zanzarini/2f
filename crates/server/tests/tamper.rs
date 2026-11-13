@@ -1233,3 +1233,54 @@ fn an_approval_given_before_a_revocation_does_not_come_back_with_the_row() {
     );
     assert!(after_bob.receipt.is_none());
 }
+
+#[test]
+fn readers_racing_a_decision_never_get_a_false_alarm() {
+    // Found by the endless run: a client asking about a request at the very
+    // moment it was decided could be told the record had been tampered with.
+    let mut w = world("race");
+    w.svc.set_policy(&w.project, r#"{"version":1,"rules":[{"name":"one","when":{},"then":{"decision":"require","requirements":[{"count":1}]}}]}"#, T0).unwrap();
+    let project = w.project.clone();
+    let alice = ServerKey::from_seed_hex(&w.alice.0.seed_hex()).unwrap();
+    let credential = w.alice.1.clone();
+    let svc = Arc::new(std::mem::replace(
+        &mut w.svc,
+        Service::open_in_memory(ServerKey::generate(), Config::default()).unwrap(),
+    ));
+    for round in 0..300 {
+        let ch = svc
+            .create_challenge(&project, big(), &format!("r{round}"), T0)
+            .unwrap();
+        let hash = svc.approver_view(&ch.id, T0).unwrap().binding;
+        let reject = round % 3 == 0;
+        let message = if reject {
+            hash.reject_hash()
+        } else {
+            hash.hash()
+        };
+        let signature = twof_core::b64(&alice.sign(&message));
+        let readers: Vec<_> = (0..6)
+            .map(|_| {
+                let (svc, project, id) = (svc.clone(), project.clone(), ch.id.clone());
+                std::thread::spawn(move || loop {
+                    let view = svc
+                        .get_challenge(&project, &id, T0)
+                        .expect("a read during a decision failed");
+                    svc.approver_view(&id, T0)
+                        .expect("the approver's read during a decision failed");
+                    if view.state != "pending" {
+                        return view.state;
+                    }
+                })
+            })
+            .collect();
+        svc.submit_approval(&ch.id, &credential, &signature, reject, T0)
+            .unwrap();
+        for reader in readers {
+            assert_eq!(
+                reader.join().unwrap(),
+                if reject { "rejected" } else { "approved" }
+            );
+        }
+    }
+}

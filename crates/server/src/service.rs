@@ -1071,6 +1071,18 @@ impl Inner {
     }
 }
 
+/// A read can start a moment before a decision is committed, and so see a
+/// request still waiting that this process already remembers as decided.
+/// That is an old snapshot, not tampering. So a reader never declares an
+/// integrity failure on its own: it asks for a second look through the
+/// writer, which always sees the latest state and whose verdict stands.
+fn second_look<T>(seen: Result<T>) -> Result<Option<T>> {
+    match seen {
+        Err(Error::Conflict(_)) => Ok(None),
+        other => other.map(Some),
+    }
+}
+
 fn fetch(conn: &Connection, id: &str) -> Result<ChallengeRow> {
     one(
         conn,
@@ -1895,7 +1907,7 @@ impl Service {
             if row.overdue(now) {
                 return Ok(None); // the expiry has to be recorded first
             }
-            inner.view(conn, row).map(Some)
+            second_look(inner.view(conn, row))
         })?;
         if let Some(view) = fresh {
             return Ok(view);
@@ -1919,7 +1931,7 @@ impl Service {
             if row.overdue(now) {
                 return Ok(None);
             }
-            inner.approver_view(conn, row).map(Some)
+            second_look(inner.approver_view(conn, row))
         })?;
         if let Some(view) = fresh {
             return Ok(view);

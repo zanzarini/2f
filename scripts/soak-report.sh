@@ -7,22 +7,26 @@ OUT="${1:-soak}"
 LOG="$OUT/summary.log"
 [ -f "$LOG" ] || { echo "no results in $OUT yet"; exit 1; }
 
-first=$(head -1 "$LOG" | cut -d' ' -f1)
-last=$(tail -1 "$LOG" | cut -d' ' -f1)
-echo "from $first to $last"
-grep -E "event=(start|stop|build_failed)" "$LOG" | tail -3
+echo "from $(head -1 "$LOG" | cut -d' ' -f1) to $(tail -1 "$LOG" | cut -d' ' -f1)"
+grep -E "event=(start|stop|build_failed)" "$LOG" | tail -4
 echo
-echo "suite        runs   failed   time spent"
+echo "suite          runs   failed    operations   machine time"
 awk '/ suite=/ {
+       delete field
        for (i = 1; i <= NF; i++) { split($i, kv, "="); field[kv[1]] = kv[2] }
-       runs[field["suite"]]++
-       if (field["result"] != "ok") failed[field["suite"]]++
-       secs[field["suite"]] += field["secs"]
+       s = field["suite"]
+       runs[s]++; all_runs++
+       if (field["result"] != "ok") { failed[s]++; all_failed++ }
+       secs[s] += field["secs"]; all_secs += field["secs"]
+       ops[s] += field["ops"]; all_ops += field["ops"]
      }
      END {
-       for (s in runs) printf "%-12s %5d   %6d   %5.1f h\n", s, runs[s], failed[s] + 0, secs[s] / 3600
-     }' "$LOG" | sort
+       for (s in runs) printf "%-12s %6d   %6d   %12d   %8.1f h\n", s, runs[s], failed[s] + 0, ops[s], secs[s] / 3600 | "sort"
+       close("sort")
+       printf "%-12s %6d   %6d   %12d   %8.1f h\n", "TOTAL", all_runs, all_failed + 0, all_ops, all_secs / 3600
+     }' "$LOG"
 echo
+echo "what happened inside the random runs:"
 # Add up the counters the long runs print (allowed_1_approved_2_... pairs).
 awk '/ suite=(model|adversary) / {
        for (i = 1; i <= NF; i++) if ($i ~ /^counts=/) {
@@ -34,7 +38,7 @@ awk '/ suite=(model|adversary) / {
          }
        }
      }
-     END { for (l in total) printf "%-28s %15d\n", l, total[l] }' "$LOG" | sort
+     END { for (l in total) printf "  %-28s %15d\n", l, total[l] }' "$LOG" | sort
 echo
 failures=$(ls "$OUT/failures" 2>/dev/null | wc -l)
 echo "failure reports saved: $failures"
